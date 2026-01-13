@@ -15,14 +15,14 @@ This script demonstrates object detection and tracking using:
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
-gi.require_version('GstWebRTC', '1.0')
-gi.require_version('GstSdp', '1.0')
-from gi.repository import Gst, GLib, GstRtspServer, GstWebRTC, GstSdp
+from gi.repository import Gst, GLib, GstRtspServer
 import json
 import threading
 import sys
+import os
 from datetime import datetime
-from MQTT import MQTTPublisher
+from collections import defaultdict
+from MQTTClient import MQTTPublisher
 from WebRTCStreamer import WebRTCStreamer
 from WebSocket import WebSocketServerWithDetectionData
 from SimpleTracker import SimpleTracker
@@ -33,6 +33,76 @@ except ImportError as e:
 
 # Initialize GStreamer
 Gst.init(None)
+
+class VideoStatistics:
+    """
+    Tracks and calculates statistics for video analysis
+    """
+    def __init__(self):
+        self.detections_per_class = defaultdict(int)
+        self.confidence_sum_per_class = defaultdict(float)
+        self.total_frames = 0
+        self.frames_with_detections = 0
+        self.unique_track_ids = set()
+        self.start_time = None
+        self.end_time = None
+        
+    def add_detection(self, class_name, confidence, track_id=None):
+        """Add a detection to statistics"""
+        self.detections_per_class[class_name] += 1
+        self.confidence_sum_per_class[class_name] += confidence
+        if track_id is not None:
+            self.unique_track_ids.add(track_id)
+    
+    def add_frame(self, has_detections=False):
+        """Record a processed frame"""
+        self.total_frames += 1
+        if has_detections:
+            self.frames_with_detections += 1
+    
+    def get_summary(self):
+        """Generate statistics summary"""
+        summary = {
+            'total_frames': self.total_frames,
+            'frames_with_detections': self.frames_with_detections,
+            'unique_objects_tracked': len(self.unique_track_ids),
+            'processing_time': None,
+            'detections_by_class': {}
+        }        
+        if self.start_time and self.end_time:
+            duration = (self.end_time - self.start_time).total_seconds()
+            summary['processing_time'] = f"{duration:.2f} seconds"
+            summary['fps'] = f"{self.total_frames / duration:.2f}" if duration > 0 else "N/A"
+        for class_name in self.detections_per_class:
+            count = self.detections_per_class[class_name]
+            avg_confidence = self.confidence_sum_per_class[class_name] / count if count > 0 else 0
+            summary['detections_by_class'][class_name] = {
+                'count': count,
+                'average_confidence': f"{avg_confidence:.4f}"
+            }
+        return summary
+    
+    def print_summary(self):
+        """Print formatted statistics summary"""
+        summary = self.get_summary()
+        print("\n" + "="*70)
+        print("VIDEO ANALYSIS STATISTICS")
+        print("="*70)
+        print(f"Total Frames Processed: {summary['total_frames']}")
+        print(f"Frames with Detections: {summary['frames_with_detections']}")
+        print(f"Unique Objects Tracked: {summary['unique_objects_tracked']}")
+        if summary['processing_time']:
+            print(f"Processing Time: {summary['processing_time']}")
+            print(f"Average FPS: {summary['fps']}")
+        
+        print("\nDetections by Class:")
+        print("-" * 70)
+        for class_name, stats in summary['detections_by_class'].items():
+            print(f"  {class_name:20s}: {stats['count']:6d} detections, "
+                  f"avg confidence: {stats['average_confidence']}")
+        print("="*70 + "\n")
+        
+        return summary
 
 class DetectionData:
     """
@@ -170,14 +240,24 @@ class HailoTrackerPipeline:
     """
     Main class for managing the GStreamer pipeline with Hailo detection and tracking.
     """
-    def __init__(self, enable_rtsp=True, enable_websocket=True, enable_webrtc=False, enable_mqtt=True, enable_debug=True):
+    def __init__(self, rpicamera=False, video_file=None, enable_rtsp=False, 
+                 enable_websocket=False, enable_webrtc=False, enable_mqtt=False, 
+                 enable_recording=False, output_video_path=None, enable_debug=False):
         self.pipeline = None
         self.loop = None
+        self.rpicamera = rpicamera
+        self.video_file = video_file
         self.enable_rtsp = enable_rtsp
         self.enable_websocket = enable_websocket
         self.enable_webrtc = enable_webrtc
         self.enable_mqtt = enable_mqtt
+        self.enable_recording = enable_recording
+        self.output_video_path = output_video_path
+        self.enable_debug = enable_debug
         self.bus = None
+        # Video analysis mode
+        self.video_mode = video_file is not None
+        self.statistics = VideoStatistics() if self.video_mode else None
         # Detection data storage
         self.detection_data = DetectionData(debug=enable_debug)
         # RTSP server
@@ -191,11 +271,13 @@ class HailoTrackerPipeline:
         if enable_webrtc: self.webrtc_streamer = WebRTCStreamer()
         # MQTT publisher
         self.mqtt_publisher = None
-        if enable_mqtt: self.mqtt_publisher = MQTTPublisher(broker_host="mqtt.portabo.cz", broker_port=8883, topic="hailo/detections", client_id="hailo_tracker", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP")
+        if enable_mqtt: self.mqtt_publisher = MQTTPublisher(broker_host="mqtt.portabo.cz", broker_port=8883, topic="/videoanalyza", client_id="hailo_tracker_client", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP")
         # Tracker
         self.tracker = SimpleTracker(max_lost_frames=30, iou_threshold=0.5)
         # frame count
         self.frame_count = 0
+        # Recording
+        self.recording_sink = None
 
     def create_pipeline(self):
         """
@@ -209,33 +291,53 @@ class HailoTrackerPipeline:
         7. hailooverlay - Draws bounding boxes and tracking IDs
         8. videoconvert - Prepares for display/encoding
         """ 
-        # Define the pipeline string
-        pipeline_str = (
-            "rtspsrc location=rtsp://admin:Dcuk.123456@192.168.37.99/Stream latency=0 "
-            "! rtph264depay "
-            "! h264parse "
-            "! avdec_h264 "
-            #"! video/x-raw, format=NV12, width=1536,height=864, framerate=30/1 " # for rpicamera
-            "! videoconvert "
+        # Define the video source based on mode
+        if self.video_file:
+            if not os.path.exists(self.video_file):
+                print(f"[ERROR] Video file not found: {self.video_file}")
+                return False
+            pipeline_str = (
+                f"filesrc location={self.video_file} "
+                "! decodebin "
+                "! videoconvert "
+            )
+        elif self.rpicamera:
+            pipeline_str = (
+                "libcamerasrc "
+                "! video/x-raw, format=NV12, width=1536,height=864, framerate=30/1 " # for rpicamera
+                "! videoconvert "
+            )
+        else:
+            pipeline_str = (
+                "rtspsrc location=rtsp://admin:Dcuk.123456@192.168.37.99/Stream latency=0 "
+                "! rtph264depay "
+                "! h264parse "
+                "! avdec_h264 "
+                "! videoconvert "
+            )
+        pipeline_str += (
             "! videoscale "
-            "! video/x-raw,format=RGB,width=640,height=640 "
+            "! video/x-raw,format=RGB "
+            "! videoscale method=lanczos "
+            "! video/x-raw, width=640, height=640 "
             "! hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef batch-size=1 "
+            "nms-score-threshold=0.5 nms-iou-threshold=0.5 name=hailonet "
             "! queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 "  # Add queue after hailonet
-            "! hailofilter function-name=yolov8m qos=false name=hailofilter "
+            "! hailofilter qos=false name=hailofilter function-name=yolov8m "
             #"config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json "
             "so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so "
             "! queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 " # Add queue after hailofilter
-            #"! hailotracker keep-past-metadata=true kalman-dist-thr=0.7 iou-thr=0.8 keep-new-frames=2 keep-tracked-frames=30 keep-lost-frames=10 name=hailotracker "
+            "! hailotracker keep-past-metadata=true kalman-dist-thr=0.7 iou-thr=0.6 keep-new-frames=2 keep-tracked-frames=30 keep-lost-frames=10 name=hailotracker "
             "! hailooverlay show-confidence=true line-thickness=2 name=hailooverlay "
             "! textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' "
             "! videoconvert "
             "! video/x-raw,format=I420 "
         )
-        if self.enable_rtsp or self.enable_webrtc:
+        if self.enable_rtsp or self.enable_webrtc or self.enable_recording:
             pipeline_str += "! tee name=t "
             branches_added = False
             # RTSP branch
-            if self.enable_rtsp:
+            if self.enable_rtsp and not self.video_mode:
                 self.rtsp_server.create_server()
                 self.rtsp_server.start()
                 pipeline_str += (
@@ -259,13 +361,29 @@ class HailoTrackerPipeline:
                     "! webrtcbin name=webrtcbin stun-server=stun://stun.l.google.com:19302 "
                 )
                 branches_added = True    
+            # Recording branch
+            if self.enable_recording and self.output_video_path:
+                pipeline_str += (
+                    "t. "
+                    "! queue leaky=downstream max-size-buffers=3 "
+                    "! videoconvert "
+                    "! video/x-raw,format=I420 "
+                    "! x264enc tune=zerolatency bitrate=4000 speed-preset=medium "
+                    f"! mp4mux ! filesink location={self.output_video_path} name=recording_sink "
+                )
+                branches_added = True
+                print(f"[INFO] Recording enabled, output: {self.output_video_path}")
+
             if not branches_added:
                 pipeline_str += "t. ! fakesink sync=false async=false "
         else:
-            pipeline_str += "! fakesink sync=false async=false "
-        print("[DEBUG] Pipeline string:")
-        print(pipeline_str)
-        print()
+            sync_mode = "false" if self.video_mode else "false"
+            pipeline_str += f"! fakesink sync={sync_mode} async=false "
+    
+        if self.enable_debug:
+            print("[DEBUG] Pipeline string:")
+            print(pipeline_str)
+            print()
         try:
             self.pipeline = Gst.parse_launch(pipeline_str) # Parse and create the pipeline from the string
             if self.pipeline is None:
@@ -281,7 +399,7 @@ class HailoTrackerPipeline:
                 pad.add_probe(Gst.PadProbeType.BUFFER, self.buffer_probe_callback)
         else:
             print("[WARNING] Could not find hailofilter element")
-    
+            
         self.bus = self.pipeline.get_bus() # Connect to the bus to handle messages
         self.bus.add_signal_watch() 
         self.bus.connect("message", self.on_message)
@@ -319,15 +437,10 @@ class HailoTrackerPipeline:
                 float(bbox.ymin() + bbox.height())
             ]
             # Get tracking ID if available
-            #tracking_id = 0
             #track = detection.get_objects_typed(HAILO_UNIQUE_ID)
             #if len(track) == 1: tracking_id = track[0].get_id()
-            #if label in ["car", "motorcycle", "truck", "bus"] and confidence > 0.4:  # Threshold for valid detections
-            #    label = detection.get_label()
-            #    confidence = detection.get_confidence()
-            #    bbox = detection.get_bbox()          
-            #Create detection dictionary
-            if confidence > 0.6:
+            if label in ["car", "motorcycle", "bicycle", "truck", "bus", "person"]:  # Threshold for valid detections
+                #Create detection dictionary
                 detection_dict = {
                     'class_id': class_id,
                     'class_name': label,
@@ -337,17 +450,33 @@ class HailoTrackerPipeline:
                     'timestamp': current_timestamp
                 }
                 detection_list.append(detection_dict)
-            #print(f"Label: {label}, Confidence: {confidence:.2f}")
-            #print(f"BBox: x={bbox.xmin()}, y={bbox.ymin()}, "
-            #      f"width={bbox.width()}, height={bbox.height()}")
+                #print(f"Label: {label}, Confidence: {confidence:.2f}")
+                #print(f"BBox: x={bbox.xmin()}, y={bbox.ymin()}, "
+                #      f"width={bbox.width()}, height={bbox.height()}")
         self.frame_count += 1
+        # Update statistics if in video mode
+        if self.statistics:
+            self.statistics.add_frame(has_detections=len(detection_list) > 0)
+        # update tracker with new detections per frame
+        tracks = self.tracker.update(detection_list)
+        # Update detection data every 30 frames from tracked objects
         if self.frame_count % 30 == 0:
-            tracks = self.tracker.update(detection_list)
             self.detection_data.update(tracks, self.frame_count)
-            ## TODO: CREATE saving tracked detections to db
+            # Update statistics with tracked objects
+            if self.statistics:
+                for track in tracks:
+                    self.statistics.add_detection(
+                        track['class_name'],
+                        track['confidence'],
+                        track.get('track_id')
+                    )
+            # Publish to MQTT
+            if self.enable_mqtt and self.mqtt_publisher and self.mqtt_publisher.connected:
+                data_dict = self.detection_data.get_dict()
+                self.mqtt_publisher.publish(data_dict)
+            ## CREATE saving tracked detections to db
             ## Prepare batch detections for database
-            #db_detections = []
-            #track_ids_to_check = []
+            #db_detections = []; track_ids_to_check = []
             #for tracked_detection in self.detection_data:
             #    track_id = tracked_detection.get('tracking_id', -1)
             #    # Skip invalid track_ids
@@ -386,12 +515,6 @@ class HailoTrackerPipeline:
             #            print(f"[Database] All {len(db_detections)} track_ids already exist, skipped insertion")
             #    except Exception as e:
             #        print(f"[Database] Error inserting detections: {e}")        
-
-        # Publish to MQTT
-        if self.enable_mqtt and self.mqtt_publisher and self.mqtt_publisher.connected:
-            if self.frame_count % 30 == 0:  # Publish every 10 frames to reduce load
-                data_dict = self.detection_data.get_dict()
-                self.mqtt_publisher.publish(data_dict)
         return Gst.PadProbeReturn.OK
     
     def on_message(self, bus, message):
@@ -428,7 +551,13 @@ class HailoTrackerPipeline:
         """
         Starts the pipeline, RTSP server, and WebSocket server
         """
-        print("[pipeline] Starting Hailo Tracker Pipeline...")
+        if self.video_mode:
+            print(f"[Pipeline] Starting Video Analysis Mode: {self.video_file}")
+            if self.statistics:
+                self.statistics.start_time = datetime.now()
+        else:
+            print("[Pipeline] Starting Hailo Tracker Pipeline...")
+
         if self.enable_mqtt and self.mqtt_publisher:
             self.mqtt_publisher.connect()
 
@@ -467,6 +596,7 @@ class HailoTrackerPipeline:
         if self.enable_websocket: print("WebSocket: ws://localhost:8765")
         if self.enable_mqtt: print(f"MQTT Topic: {self.mqtt_publisher.topic}")
         if self.enable_webrtc: print("WebRTC: Requires signaling server")
+        if self.enable_recording: print(f"Recording to: {self.output_video_path}")
         print("="*60)
         print("\n⌨Press Ctrl+C to stop\n")
         # Create and start the main loop
@@ -491,24 +621,80 @@ class HailoTrackerPipeline:
         # Quit the main loop
         if self.loop:
             self.loop.quit()
+        # Print statistics if in video mode
+        if self.statistics:
+            summary = self.statistics.print_summary()    
+            # Save statistics to JSON file
+            if self.video_file:
+                stats_file = self.video_file.rsplit('.', 1)[0] + '_statistics.json'
+                with open(stats_file, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                print(f"Statistics saved to: {stats_file}")
         print("Pipeline stopped")
+    
+    def get_statistics(self):
+        """Returns statistics object for programmatic access"""
+        return self.statistics
 
 def main():
     """
     Main entry point for the application
     """
+    # rpicamera=True, video_file=None, enable_rtsp=True, 
+    #             enable_websocket=True, enable_webrtc=False, enable_mqtt=True, 
+    #             enable_recording=False, output_video_path=None, enable_debug=True
+    import argparse
+    parser = argparse.ArgumentParser(description='Hailo Detection Pipeline')
+    parser.add_argument('--rpicamera', action='store_true', help='Use RPi camera stream (IP camera 192.168.37.99 stream default)')
+    parser.add_argument('--video-file', type=str, help='Enter path to video file for analysis (if not set, uses camera or RTSP)')
+    parser.add_argument('--enable-rtsp', action='store_true', help='Enable RTSP streaming (default False)')
+    parser.add_argument('--enable-websocket', action='store_true', help='Enable WebSocket (default False)')
+    parser.add_argument('--enable-webrtc', action='store_true', help='Enable WebRTC (default False)')
+    parser.add_argument('--enable-mqtt', action='store_true', help='Enable MQTT (default False)')
+    parser.add_argument('--enable-recording', action='store_true', help='Enable recording output video (default False)')
+    parser.add_argument('--output-path', type=str, help='Output video file path if recording is enabled')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output (default False)')
+    args = parser.parse_args()
     print("=" * 60)
     print("Hailo Tracker Pipeline - Raspberry Pi AI HAT+ (26 TOPS)")
     print("=" * 60)
-    print("Camera: IMX708")
+    # Determine source
+    video_file = args.video_file
+    use_camera = args.rpicamera
+    if video_file:
+        print(f"Video File: {video_file}")
+        print("Mode: Video Analysis")
+    elif use_camera:
+        print("Camera: IMX708")
+    else:
+        print("Source: RTSP Stream")
     print("Model: YOLOv8m")
     print("Accelerator: Hailo 26 TOPS")
-    print("Streaming: RTSP + WebSocket")
     print("=" * 60)
     print(f"GStreamer version: {Gst.version_string()}")
     print() 
+    # Set output path for recording
+    output_path = args.output_path
+    if args.enable_recording and not output_path:
+        if video_file:
+            base_name = os.path.splitext(video_file)[0]
+            output_path = f"{base_name}_processed.mp4"
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = f"hailo_output_{timestamp}.mp4"
+    
     # Create and start the pipeline with all features enabled
-    tracker = HailoTrackerPipeline(enable_rtsp=True, enable_websocket=False, enable_webrtc=False, enable_mqtt=False)
+    tracker = HailoTrackerPipeline(
+        rpicamera=use_camera, 
+        video_file=video_file,
+        enable_rtsp=args.enable_rtsp, 
+        enable_websocket=args.enable_websocket, 
+        enable_webrtc=args.enable_webrtc, 
+        enable_mqtt=args.enable_mqtt,
+        enable_recording=args.enable_recording,
+        output_video_path=output_path,
+        enable_debug=args.debug
+    )
     tracker.create_pipeline()
     tracker.start()
     return 0
@@ -679,5 +865,5 @@ gst-launch-1.0 \
 Launch RSTP stream from camera:
 gst-launch-1.0 -v rtspsrc location=rtsp://192.168.37.205:8554/hailo_stream latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
 Launch real stream from camera:
-gst-launch-1.0 rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Streaming/Channels" latency=0 !   rtph264depay ! h264parse ! avdec_h264 ! vid
+gst-launch-1.0 rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Streaming/Channels" latency=0 !   rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
 """

@@ -27,5 +27,18 @@ loop = GLib.MainLoop()
 loop.run()
 
 """
+#viewing hailo stream command
 gst-launch-1.0 -v rtspsrc location=rtsp://192.168.37.205:8554/hailo_stream latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
+
+#vieving camera stream command
+gst-launch-1.0 rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Stream" latency=0 !   rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
+
+# wiewing camera stream command with recording 
+gst-launch-1.0 -e rtspsrc location=rtsp://admin:Dcuk.123456@192.168.37.99/Stream latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! mp4mux ! filesink location=outputc264-202601121236.mp4
+
+#recording command
+gst-launch-1.0 -e \
+rtspsrc location=rtsp://admin:Dcuk.123456@192.168.37.99:554/Stream latency=0 ! \
+rtph264depay ! h264parse ! \
+mp4mux ! filesink location=recording.mp4
 """
