@@ -8,26 +8,19 @@ import time
 
 class MQTTPublisher:
     """MQTT client for publishing detection data"""    
-    def __init__(self, broker_host="mqtt.portabo.cz", broker_port=8883, topic="patrik/traffic_detection", client_id="hailo_tracker", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP"):
+    def __init__(self, broker_host="mqtt.portabo.cz", broker_port=8883, topic="patrik/traffic_detection", client_id="hailo_tracker", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP", debug=False):
         self.broker_host = broker_host
         self.broker_port = broker_port
         self.topic = topic
         self.client_id = client_id
         self.username = username
         self.password = password
-        # Storage for detections and statistics
-        self.detections = []
-        self.statistics = {
-            "total_detections": 0,
-            "detections_by_type": {},
-            "last_detection_time": None,
-            "session_start": datetime.now().isoformat()
-        }
         # Setup MQTT client
         self.client = mqtt.Client(client_id=self.client_id)
         self.client.username_pw_set(self.username, self.password)
         # Setup SSL/TLS
         self.client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLSv1_2)
+        self.client.tls_insecure_set(False)
         # Setup callbacks
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
@@ -35,7 +28,8 @@ class MQTTPublisher:
         
         self.connected = False
         self.lock = threading.Lock()
-    
+        self.debug = False
+
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.connected = True
@@ -53,36 +47,28 @@ class MQTTPublisher:
     def on_message(self, client, userdata, msg):
         try:
             payload = json.loads(msg.payload.decode())
-            timestamp = datetime.now().isoformat()        
-            detection_data = {
-                "timestamp": timestamp,
-                "topic": msg.topic,
-                "data": payload
-            }
+            #timestamp = datetime.now().isoformat()        
+            #detection_data = {
+            #    "timestamp": timestamp,
+            #    "topic": msg.topic,
+            #    "data": payload
+            #}
+            if userdata and "db" in userdata:
+                userdata["db"]._process_mqtt_message(msg)
             with self.lock:
-                # Store detection
-                self.detections.append(detection_data)   
-                # Update statistics
-                self.statistics["total_detections"] += 1
-                self.statistics["last_detection_time"] = timestamp
-                # Count by detection type if available
-                detection_type = payload.get("type", "unknown")
-                if detection_type in self.statistics["detections_by_type"]:
-                    self.statistics["detections_by_type"][detection_type] += 1
-                else:
-                    self.statistics["detections_by_type"][detection_type] = 1
-                # Keep only last 1000 detections to prevent memory overflow
-                if len(self.detections) > 1000:
-                    self.detections = self.detections[-1000:]
-            print(f"Received detection: {detection_type} at {timestamp}") 
+                if self.debug:
+                    print(f"MQTT detections received: {payload['detections'] if 'detections' in payload else 'No detections'}")
+            #print(f"Received detection: {detection_type} at {timestamp}") 
         except json.JSONDecodeError:
             print(f"Failed to decode message: {msg.payload}")
         except Exception as e:
             print(f"Error processing message: {e}")
     
-    def connect(self):
+    def connect(self, userdata: Optional[Dict] = None):
         """Connect to the MQTT broker"""
         try:
+            if userdata:
+                self.client.user_data_set(userdata)
             self.client.connect(self.broker_host, self.broker_port, keepalive=60)
             self.client.loop_start()
             # Wait for connection
@@ -104,57 +90,6 @@ class MQTTPublisher:
             self.client.disconnect()
             print("[MQTT] Disconnected")
 
-    def get_recent_detections(self, limit: Optional[int] = None, minutes: Optional[int] = None, detection_type: Optional[str] = None) -> List[Dict]:
-        """
-        Get recent detections from storage    
-        Args:
-            limit: Maximum number of detections to return (most recent)
-            minutes: Only return detections from the last N minutes
-            detection_type: Filter by detection type
-        Returns:
-            List of detection dictionaries
-        """
-        with self.lock:
-            filtered_detections = self.detections.copy()   
-        # Filter by time if specified
-        if minutes:
-            cutoff_time = datetime.now() - timedelta(minutes=minutes)
-            filtered_detections = [
-                d for d in filtered_detections
-                if datetime.fromisoformat(d["timestamp"]) > cutoff_time
-            ]
-        # Filter by detection type if specified
-        if detection_type:
-            filtered_detections = [
-                d for d in filtered_detections
-                if d["data"].get("type") == detection_type
-            ]
-        # Apply limit if specified
-        if limit:
-            filtered_detections = filtered_detections[-limit:]
-        return filtered_detections
-    
-    def get_statistics(self) -> Dict:
-        """
-        Get current statistics about detections    
-        Returns:
-            Dictionary containing statistics including:
-            - total_detections: Total number of detections received
-            - detections_by_type: Count of each detection type
-            - last_detection_time: Timestamp of last detection
-            - session_start: When the session started
-            - session_duration_seconds: How long the session has been running
-        """
-        with self.lock:
-            stats = self.statistics.copy()
-        # Calculate session duration
-        session_start = datetime.fromisoformat(stats["session_start"])
-        duration = (datetime.now() - session_start).total_seconds()
-        stats["session_duration_seconds"] = duration
-        # Add current detections count
-        stats["stored_detections_count"] = len(self.detections)
-        return stats
-    
     def publish(self, data_dict):
         """Publish detection data to MQTT topic"""
         if self.connected and self.client:
@@ -182,13 +117,7 @@ class MQTTPublisher:
         """
         if not self.connected:
             print("Not connected. Cannot publish bulk messages.")
-            return {
-                "total": len(detections),
-                "sent": 0,
-                "failed": len(detections),
-                "duration": 0,
-                "error": "Not connected"
-            } 
+            return {"total": len(detections), "sent": 0, "failed": len(detections), "duration": 0, "error": "Not connected" } 
         start_time = time.time()
         sent_count = 0
         failed_count = 0
@@ -198,12 +127,7 @@ class MQTTPublisher:
                 print(f"Publishing {len(detections)} detections in batches of {batch_size}...")
                 for i in range(0, len(detections), batch_size):
                     batch = detections[i:i + batch_size]
-                    batch_message = {
-                        "type": "bulk_detections",
-                        "batch_number": i // batch_size + 1,
-                        "detections": batch,
-                        "timestamp": datetime.now().isoformat()
-                    }
+                    batch_message = { "type": "bulk_detections", "batch_number": i // batch_size + 1, "detections": batch, "timestamp": datetime.now().isoformat() }
                     try:
                         payload = json.dumps(batch_message)
                         result = self.client.publish(self.topic, payload, qos=1)   
@@ -241,13 +165,7 @@ class MQTTPublisher:
         except Exception as e:
             print(f"Bulk publish error: {e}")
         duration = time.time() - start_time
-        summary = {
-            "total": len(detections),
-            "sent": sent_count,
-            "failed": failed_count,
-            "duration": duration,
-            "rate": sent_count / duration if duration > 0 else 0
-        }
+        summary = { "total": len(detections), "sent": sent_count, "failed": failed_count, "duration": duration, "rate": sent_count / duration if duration > 0 else 0 }
         print(f"\n--- Bulk Publish Summary ---")
         print(f"Total: {summary['total']}")
         print(f"Sent: {summary['sent']}")
@@ -280,18 +198,6 @@ if __name__ == "__main__":
         print("\nListening for detections... (Press Ctrl+C to stop)")
         while True:
             time.sleep(5)
-            # Example: Get statistics every 5 seconds
-            stats = client.get_statistics()
-            print(f"\n--- Statistics ---")
-            print(f"Total detections: {stats['total_detections']}")
-            print(f"By type: {stats['detections_by_type']}")
-            print(f"Session duration: {stats['session_duration_seconds']:.1f}s")
-            # Example: Get last 5 detections
-            recent = client.get_recent_detections(limit=5)
-            if recent:
-                print(f"\nLast {len(recent)} detections:")
-                for det in recent:
-                    print(f"  - {det['timestamp']}: {det['data']}")
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:

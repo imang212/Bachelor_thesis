@@ -10,9 +10,16 @@ import asyncio
 from time import sleep
 from contextlib import asynccontextmanager
 import subprocess
+import threading
 
-from ..pipeline.DetectionWithGStreamer_pipeline import HailoTrackerPipeline
+from DatabaseManagerPostgre import PostgreDatabaseManager
 from ServoControl import ContinuousServo
+try:
+    from ..pipeline.DetectionWithGStreamer_pipeline import HailoTrackerPipeline
+    PIPELINE_AVAILABLE = True
+except ImportError:
+    PIPELINE_AVAILABLE = False
+    print("[WARNING] Pipeline module not found - AI endpoints will be limited")
 
 ## MODELS
 # Servo control request
@@ -23,6 +30,26 @@ class ServoRequest(BaseModel):
 class CameraSettings(BaseModel):
     width: int = Field(1536, ge=1536, le=4608)
     height: int = Field(864, ge=864, le=2592)
+# Pipeline configuration model
+class PipelineConfig(BaseModel):
+    """Configuration for starting AI pipeline"""
+    rpicamera: bool = Field(False, description="Use Raspberry Pi camera")
+    video_file: Optional[str] = Field(None, description="Path to video file")
+    enable_rtsp: bool = Field(False, description="Enable RTSP streaming")
+    enable_websocket: bool = Field(False, description="Enable WebSocket")
+    enable_webrtc: bool = Field(False, description="Enable WebRTC")
+    enable_mqtt: bool = Field(True, description="Enable MQTT")
+    enable_recording: bool = Field(False, description="Enable video recording")
+    output_path: Optional[str] = Field(None, description="Output video path")
+    enable_debug: bool = Field(False, description="Enable debug mode")
+# Pipeline status response model
+class PipelineStatus(BaseModel):
+    """Pipeline status response"""
+    running: bool
+    mode: Optional[str]
+    fps: Optional[float]
+    total_tracked: Optional[int]
+    config: Optional[Dict[str, Any]]
 # Detection response model
 class DetectionResponse(BaseModel):
     """Response model for detection data via REST API."""
@@ -30,49 +57,63 @@ class DetectionResponse(BaseModel):
     frame_id: int
     label: str
     confidence: float
-    bbox: List[int]  # [x1, y1, x2, y2]
-    track_id: int
-    total_count: int
+    bbox: List[float]  # [x1, y1, x2, y2]
+    track_id: Optional[int]
 # Statistics response model
 class StatisticsResponse(BaseModel):
     """Response model for traffic statistics."""
-    label: str
-    count: int
+    class_name: str
+    total_detections: int
+    unique_tracks: int
     avg_confidence: float
-# Health check response model
-class HealthResponse(BaseModel):
+    min_confidence: float
+    max_confidence: float
+# Health check response model for database
+class HealthResponseDB(BaseModel):
     """Health check response."""
     status: str
-    fps: float
-    total_tracked: int
-    timestamp: str
+    total_detections: int
+    latest_detection: Optional[str]
+    database_size: str
 
-# Global pipeline instance for AI process
-pipeline: Optional[HailoTrackerPipeline] = None
+# Global database instance
+db: Optional[PostgreDatabaseManager] = None
+servo_L: Optional[ContinuousServo] = None
+pipeline: Optional['HailoTrackerPipeline'] = None
+pipeline_thread: Optional[threading.Thread] = None
+pipeline_config: Optional[Dict[str, Any]] = None
 
-# INITIALIZE SERVO/S A MONITORING PIPELINE ON STARTUP AND STOP ON SHUTDOWN
+# database configuration
+DB_CONFIG = {'host': '192.168.37.31', 'port': 5432, 'database': 'hailo_db', 'user': 'hailo_user', 'password': 'hailo_pass', 'min_connections': 2, 'max_connections': 10 }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    FastAPI lifespan context manager.
-    Handles startup and shutdown services.
-    - Startup: Initialize and start pipeline in background task
-    - Shutdown: Stop pipeline and cleanup resources
+    FastAPI lifespan context manager. Handles startup and shutdown services.
     """
-    global pipeline
-    global servo_L
+    global servo_L, db
     # Startup
     print("[FastAPI] Starting up...")
-    pipeline = HailoTrackerPipeline(enable_rtsp=True, enable_websocket=False, enable_webrtc=False, enable_mqtt=False, enable_debug=False)
-    servo_L = ContinuousServo(chip=0, pin=18) # FIRST SERVO ON PIN 18
-    # Start pipeline in background
-    pipeline.create_pipeline()
-    pipeline.start() 
+    # Initialize database
+    try:
+        # Create database manager instance
+        db = PostgreDatabaseManager(DB_CONFIG)
+        print("[FastAPI] Database connected successfully")
+    except Exception as e:
+        print(f"[FastAPI] Database connection failed: {e}")
+        db = None
+    # Initialize servo
+    try:
+        servo_L = ContinuousServo(chip=0, pin=18) # FIRST SERVO ON PIN 18
+        print("[FastAPI] Servo initialized")
+    except Exception as e:
+        print(f"[FastAPI] Servo initialization failed: {e}")
+        servo_L = None
     yield
     # Shutdown
     print("[FastAPI] Shutting down...")
-    if pipeline: pipeline.stop()
     if servo_L: servo_L.cleanup()
+    if db: db.close()
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
@@ -83,6 +124,26 @@ CAPTURE_DIR.mkdir(exist_ok=True)
 
 # Allow frontend access
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],)
+
+## HELPER FUNCTIONS
+def check_pipeline_instance():
+    """Check if pipeline instance exists and is properly initialized"""
+    global pipeline
+    if pipeline is None:
+        return False, "Pipeline not initialized"
+    return True, "Pipeline instance available"
+def check_db_instance():
+    """Check if database instance exists and is connected"""
+    global db
+    if db is None:
+        return False, "Database not initialized"
+    try:
+        if db.verify_pool():
+            return True, "Database connected"
+        else:
+            return False, "Database connection pool verification failed"
+    except Exception as e:
+        return False, f"Database error: {str(e)}"
 
 ## SERVO MOVE ENDPOINT
 @app.post("/servo/move")
@@ -97,28 +158,86 @@ async def move_servo(data: ServoRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Servo error: {str(e)}")
 
-## AI TRAFFIC DETECTION ENDPOINTS
-# HEALTH AI CHECK ENDPOINT
-@app.get("/health/ai", response_model=HealthResponse)
-async def health_check():
-    """
-    Health check endpoint.
-    Returns current system status:
-    - Status (running/stopped)
-    - Actual FPS
-    - Total tracked objects
-    - Current timestamp
-    Returns: HealthResponse with system metrics
-    """
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    return HealthResponse(
-        status="running" if pipeline.running else "stopped",
-        fps=pipeline.fps_actual,
-        total_tracked=pipeline.counter.get_total_count(),
-        timestamp=datetime.now().isoformat()
-    )
+## DATABASE MANAGEMENT ENDPOINTS
+@app.get("/database/status")
+async def database_status():
+    """Check database connection status"""
+    is_connected, message = check_db_instance()
+    if is_connected and db:
+        try:
+            health = db.get_health_status()
+            return { "connected": True, "status": health['status'], "message": message, "health": health }
+        except Exception as e:
+            return { "connected": False, "status": "error", "message": f"Health check failed: {str(e)}" }    
+    return { "connected": False, "status": "disconnected", "message": message }
 
-# SHOW RECENT DETECTIONS FROM DATABASE ENDPOINT
+@app.post("/database/start")
+async def database_start():
+    """Start/initialize database connection"""
+    global db    
+    if db is not None:
+        is_connected, message = check_db_instance()
+        if is_connected:
+            return { "status": "already_running", "message": "Database is already connected" }
+    try:
+        db = PostgreDatabaseManager(DB_CONFIG)
+        return { "status": "started", "message": "Database connection established successfully" }
+    except Exception as e:
+        db = None
+        raise HTTPException( status_code=500, detail=f"Failed to start database connection: {str(e)}" )
+
+@app.post("/database/stop")
+async def database_stop():
+    """Stop/close database connection"""
+    global db
+    if db is None:
+        return { "status": "already_stopped", "message": "Database is not running" }
+    try:
+        db.close()
+        db = None
+        return { "status": "stopped", "message": "Database connection closed successfully"
+        }
+    except Exception as e:
+        raise HTTPException( status_code=500, detail=f"Failed to stop database: {str(e)}" )
+
+@app.post("/database/restart")
+async def database_restart():
+    """Restart database connection"""
+    global db
+    # Stop if running
+    if db is not None:
+        try:
+            db.close()
+        except Exception as e:
+            print(f"[FastAPI] Error closing database: {e}")
+        db = None
+    # Start fresh connection
+    try:
+        db = PostgreDatabaseManager(DB_CONFIG)
+        return { "status": "restarted", "message": "Database connection restarted successfully" }
+    except Exception as e:
+        db = None
+        raise HTTPException( status_code=500, detail=f"Failed to restart database: {str(e)}" )
+
+app.get("/health/ai", response_model=HealthResponseDB)
+async def health_check_ai():
+    """Health check endpoint for database."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    
+    try:
+        health = db.get_health_status()
+        return HealthResponseDB(
+            status=health['status'],
+            total_detections=health['total_detections'],
+            latest_detection=health['latest_detection'].isoformat() if health['latest_detection'] else None,
+            database_size=health['database_size']
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+
+## DATABASE QUERIES ENDPOINTS
+# STATISTICS FROM DB ENDPOINT
 @app.get("/api/detections", response_model=List[DetectionResponse])
 async def get_detections(minutes: int = 5, limit: int = 100):
     """
@@ -126,31 +245,28 @@ async def get_detections(minutes: int = 5, limit: int = 100):
     Query parameters:
     - minutes: Look back N minutes (default: 5)
     - limit: Maximum records to return (default: 100)
-    Args:
-        minutes: Time window in minutes
-        limit: Max number of records
-    Returns:
-        List of recent detections
-    Example:
-        GET /api/detections?minutes=10&limit=50
+    Example: GET /api/detections?minutes=10&limit=50
     """
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    
-    detections = pipeline.db.get_recent_detections(minutes, limit)
-    return [
-        DetectionResponse(
-            timestamp=d['timestamp'],
-            frame_id=d['frame_id'],
-            label=d['label'],
-            confidence=d['confidence'],
-            bbox=[d['x1'], d['y1'], d['x2'], d['y2']],
-            track_id=d['track_id'],
-            total_count=d['total_count']
-        )
-        for d in detections
-    ]
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        detections = db.get_recent_detections(minutes=minutes, limit=limit)
+        return [
+            DetectionResponse(
+                id=d['id'],
+                timestamp=d['timestamp_'].isoformat() if hasattr(d['timestamp_'], 'isoformat') else str(d['timestamp_']),
+                frame_id=d['frame_id'],
+                class_name=d['class_name'],
+                confidence=d['confidence'],
+                bbox=[d['x1'], d['y1'], d['x2'], d['y2']],
+                track_id=d['track_id']
+            )
+            for d in detections
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching detections: {str(e)}")
 
-# STATISTICS FROM DB ENDPOINT
+# REAL-TIME CURRENT STATE ENDPOINT
 @app.get("/api/statistics", response_model=Dict[str, StatisticsResponse])
 async def get_statistics(hours: int = 1):
     """
@@ -159,199 +275,216 @@ async def get_statistics(hours: int = 1):
     within the specified time window.
     Args:
         hours: Time window in hours (default: 1)
-    Returns:
-        Dictionary mapping object labels to statistics
-    Example:
-        GET /api/statistics?hours=24
-        Response:
-        {"car": {"count": 150, "avg_confidence": 0.92}, "truck": {"count": 23, "avg_confidence": 0.88}, "person": {"count": 45, "avg_confidence": 0.85}}
+    Example: GET /api/statistics?hours=24
     """
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    stats = pipeline.db.get_statistics(hours)
-    return {
-        label: StatisticsResponse(
-            label=label,
-            count=data['count'],
-            avg_confidence=data['avg_confidence']
-        )
-        for label, data in stats.items()
-    }
-
-# REAL-TIME CURRENT STATE ENDPOINT
-@app.get("/api/current/ai")
-async def get_current_state():
-    """
-    Get current real-time state.
-    Returns:
-    - Current frame_id
-    - Active detections in current frame
-    - Real-time statistics
-    - Current FPS
-    Returns:
-        Current system state
-    This is useful for getting immediate state without WebSocket connection.
-    """
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    return {
-        "frame_id": pipeline.frame_id,
-        "timestamp": datetime.now().isoformat(),
-        "detections": [det.to_dict() for det in pipeline.current_detections],
-        "statistics": {
-            "total_count": pipeline.counter.get_total_count(),
-            "counts_by_type": pipeline.counter.get_counts(),
-            "fps": round(pipeline.fps_actual, 1)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    try:
+        stats = db.get_statistics(hours=hours)
+        return {
+            class_name: StatisticsResponse(
+                class_name=class_name,
+                total_detections=data['total_detections'],
+                unique_tracks=data['unique_tracks'],
+                avg_confidence=data['avg_confidence'],
+                min_confidence=data['min_confidence'],
+                max_confidence=data['max_confidence']
+            )
+            for class_name, data in stats.items()
         }
-    }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching statistics: {str(e)}")
 
 # BULK INSERT MULTIPLE DETECTIONS ENDPOINT
 @app.post("/api/detections/bulk")
 async def create_bulk_detections(detections: List[Dict[str, Any]]):
-    """
-    Manually insert bulk detections into database.    
-    This endpoint allows external systems to push detection data into the database. Useful for testing or integrating external detectors.
-    Args:
-        detections: List of detection dictionaries
-    Returns:
-        Success message with count
-    Example request body:
-    [{"timestamp": "2024-11-20T10:30:00","frame_id": 0,"label": "car","confidence": 0.95, "x1": 100, "y1": 100, "x2": 200, "y2": 200, "track_id": 1, "total_count": 1}]
-    """
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    pipeline.db.insert_batch_detections(detections)
+    """Manually insert bulk detections into database."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")    
+    try:
+        db.insert_batch_detections(detections)
+        return { "message": "Detections inserted successfully", "count": len(detections) }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error inserting detections: {str(e)}")
+
+## AI PIPELINE DETECTION ENDPOINTS
+@app.get("/pipeline/status", response_model=PipelineStatus)
+async def pipeline_status():
+    """Get current pipeline status"""
+    if not PIPELINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Pipeline module not available" ) 
+    if pipeline is None:
+        return PipelineStatus(running=False, mode=None, fps=None, total_tracked=None, config=None )
+    try:
+        # Determine mode
+        mode = "unknown"
+        if pipeline_config:
+            if pipeline_config.get('video_file'):
+                mode = "video_file"
+            elif pipeline_config.get('rpicamera'):
+                mode = "rpicamera"
+            else:
+                mode = "rtsp_stream"
+        return PipelineStatus(
+            running=getattr(pipeline, 'running', False),
+            mode=mode,
+            fps=getattr(pipeline, 'fps_actual', 0.0),
+            total_tracked=pipeline.counter.get_total_count() if hasattr(pipeline, 'counter') else 0,
+            config=pipeline_config
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting pipeline status: {str(e)}" )
+
+
+@app.post("/pipeline/start")
+async def pipeline_start(config: PipelineConfig):
+    """Start AI detection pipeline with specified configuration"""
+    global pipeline, pipeline_thread, pipeline_config
+    if not PIPELINE_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Pipeline module not available" )
+    # Check if already running
+    if pipeline is not None and getattr(pipeline, 'running', False):
+        raise HTTPException(status_code=409, detail="Pipeline is already running. Stop it first." )
+    # Check database connection
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not connected. Start database first." )
+    try:
+        # Generate output path if recording enabled
+        output_path = config.output_path
+        if config.enable_recording and not output_path:
+            if config.video_file:
+                import os
+                base_name = os.path.splitext(config.video_file)[0]
+                output_path = f"{base_name}_processed.mp4"
+            else:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                output_path = f"hailo_output_{timestamp}.mp4"
+        # Store configuration
+        pipeline_config = config.dict()
+        pipeline_config['output_path'] = output_path
+        # Create pipeline instance
+        pipeline = HailoTrackerPipeline(
+            rpicamera=config.rpicamera,
+            video_file=config.video_file,
+            enable_rtsp=config.enable_rtsp,
+            enable_websocket=config.enable_websocket,
+            enable_webrtc=config.enable_webrtc,
+            enable_mqtt=config.enable_mqtt,
+            enable_recording=config.enable_recording,
+            output_video_path=output_path,
+            enable_debug=config.enable_debug,
+        )
+        # Set database instance if pipeline expects it
+        if hasattr(pipeline, 'db') and pipeline.db is None:
+            pipeline.db = db
+        # Create and start pipeline
+        pipeline.create_pipeline()
+        # Start in separate thread
+        def run_pipeline():
+            try:
+                pipeline.start()
+            except Exception as e:
+                print(f"[Pipeline Thread] Error: {e}")
+        pipeline_thread = threading.Thread(target=run_pipeline, daemon=True)
+        pipeline_thread.start()
+        # Wait a moment to ensure it starts
+        await asyncio.sleep(1)
+        return { "status": "started", "message": "Pipeline started successfully", "config": pipeline_config }
+    except Exception as e:
+        pipeline = None
+        pipeline_config = None
+        raise HTTPException( status_code=500, detail=f"Failed to start pipeline: {str(e)}" )
+
+@app.post("/pipeline/stop")
+async def pipeline_stop():
+    """Stop AI detection pipeline"""
+    global pipeline, pipeline_config
+    if pipeline is None:
+        return { "status": "already_stopped", "message": "Pipeline is not running" }
+    try:
+        # Stop the pipeline
+        if hasattr(pipeline, 'stop'):
+            pipeline.stop()
+        # Clear references
+        pipeline = None
+        pipeline_config = None
+        return { "status": "stopped", "message": "Pipeline stopped successfully" }
+    except Exception as e:
+        raise HTTPException( status_code=500, detail=f"Failed to stop pipeline: {str(e)}" )
+
+@app.post("/pipeline/restart")
+async def pipeline_restart(config: Optional[PipelineConfig] = None):
+    """Restart pipeline with same or new configuration"""
+    global pipeline, pipeline_config
+    # Stop if running
+    if pipeline is not None:
+        try:
+            if hasattr(pipeline, 'stop'):
+                pipeline.stop()
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"[FastAPI] Error stopping pipeline: {e}")
+        pipeline = None
+    # Use previous config if not provided
+    if config is None:
+        if pipeline_config is None:
+            raise HTTPException( status_code=400, detail="No previous configuration found. Provide new configuration." )
+        config = PipelineConfig(**pipeline_config)
+    # Start with configuration
+    return await pipeline_start(config)
+
+@app.get("/pipeline/modes")
+async def pipeline_modes():
+    """Get available pipeline modes and their descriptions"""
     return {
-        "message": "Detections inserted successfully",
-        "count": len(detections)
+        "modes": {
+            "rpicamera": {
+                "description": "Use Raspberry Pi Camera (IMX708)",
+                "config": {"rpicamera": True}
+            },
+            "rtsp_stream": {
+                "description": "Use RTSP IP Camera Stream",
+                "config": {"rpicamera": False, "video_file": None}
+            },
+            "video_file": {
+                "description": "Analyze video file",
+                "config": {"video_file": "/path/to/video.mp4"}
+            }
+        },
+        "features": {
+            "enable_rtsp": "Enable RTSP streaming output",
+            "enable_websocket": "Enable WebSocket data streaming",
+            "enable_webrtc": "Enable WebRTC streaming",
+            "enable_mqtt": "Enable MQTT message publishing",
+            "enable_recording": "Record processed video output",
+            "enable_debug": "Enable debug logging"
+        }
     }
 
-# WEBSOCKET ENDPOINT FOR REAL-TIME STREAMING
-@app.websocket("/ws/ai")
-async def websocket_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time detection streaming.
-    Protocol:
-    1. Client connects to ws://server:8000/ws
-    2. Server accepts connection
-    3. Server continuously sends detection data as JSON
-    4. Client receives updates in real-time
-    Usage (JavaScript):
-    ```javascript
-    const ws = new WebSocket('ws://localhost:8000/ws');
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        console.log('Detections:', data.detections);
-        console.log('Statistics:', data.statistics);
-    };
-    ```
-    Args:
-        websocket: FastAPI WebSocket connection
-    """
+@app.get("/api/current/ai")
+async def get_current_state():
+    """Get current real-time state from running pipeline"""
     if pipeline is None:
-        await websocket.close(code=1011, reason="Pipeline not initialized")
-        return
-    # Accept and register connection
-    await pipeline.ws_manager.connect(websocket)
+        raise HTTPException( status_code=503, detail="Pipeline not running" )
     try:
-        # Keep connection alive and handle incoming messages
-        while True:
-            # Wait for messages from client (e.g., commands, config changes)
-            data = await websocket.receive_text()
-            # Echo back or process commands
-            # For now, just acknowledge
-            await websocket.send_json({
-                "type": "ack",
-                "message": "Message received",
-                "data": data
-            })
-    except WebSocketDisconnect:
-        # Client disconnected
-        pipeline.ws_manager.disconnect(websocket)
+        current_detections = []
+        if hasattr(pipeline, 'current_detections'):
+            current_detections = [
+                det.to_dict() if hasattr(det, 'to_dict') else det
+                for det in pipeline.current_detections
+            ]
+        return {
+            "frame_id": getattr(pipeline, 'frame_id', 0),
+            "timestamp": datetime.now().isoformat(),
+            "detections": current_detections,
+            "statistics": {
+                "total_count": pipeline.counter.get_total_count() if hasattr(pipeline, 'counter') else 0,
+                "counts_by_type": pipeline.counter.get_counts() if hasattr(pipeline, 'counter') else {},
+                "fps": round(getattr(pipeline, 'fps_actual', 0.0), 1)
+            }
+        }
     except Exception as e:
-        print(f"[WebSocket] Error: {e}")
-        pipeline.ws_manager.disconnect(websocket)
-
-# ENDPOINT FOR WEBSOCKET TESTING
-@app.get("/test-ws", response_class=HTMLResponse)
-async def test_websocket_page():
-    html = """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8" />
-        <title>WebSocket Tester</title>
-        <style>body { font-family: Arial; margin: 20px; } #log { white-space: pre-wrap; background: #eee; padding: 10px; border-radius: 8px; }</style>
-    </head>
-    <body>
-        <h2>WebSocket Test Page</h2>
-        <p>Připojuji se na: <b>wss://192.168.37.205:8000/ws/ai</b></p>
-        <button onclick="sendTest()">Send Test Message</button>
-        <h3>Log:</h3>
-        <div id="log"></div>
-        <script>
-            let logDiv = document.getElementById("log");
-            function log(msg) {
-                logDiv.textContent += msg + "\\n";
-            }
-            // Připojení na WebSocket server
-            let ws = new WebSocket("wss://192.168.37.205:8000/ws/ai");
-            ws.onopen = () => {
-                log("WebSocket připojen!");
-            };
-            ws.onmessage = (event) => {
-                log("Přišla zpráva: " + event.data);
-            };
-            ws.onerror = (error) => {
-                log("Chyba: " + error);
-            };
-            ws.onclose = () => {
-                log("WebSocket byl uzavřen.");
-            };
-            function sendTest() {
-                if (ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ test: "Hello from browser!" }));
-                    log("Odesláno: Hello from browser!");
-                } else {
-                    log("WebSocket není připojen!");
-                }
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
-
-# MJPEG VIDEO AI STREAM ENDPOINT
-@app.get("/stream/ai")
-async def video_stream():
-    """
-    MJPEG video stream endpoint.
-    Streams annotated video frames as Motion JPEG.
-    Can be viewed directly in browser or embedded in <img> tag.
-    Usage:
-    <img src="http://localhost:8000/stream" />
-    Returns: StreamingResponse with MJPEG video
-    Note: This is more resource-intensive than WebSocket.
-    Use WebSocket for detection data and render on frontend instead.
-    """
-    from fastapi.responses import StreamingResponse
-    import cv2
-    if pipeline is None: raise HTTPException(status_code=503, detail="Pipeline not initialized")
-    async def generate_frames():
-        """Generate MJPEG frames."""
-        while True:
-            frame = pipeline.get_annotated_frame()
-            if frame is None:
-                await asyncio.sleep(0.01)
-                continue
-            # Encode frame as JPEG
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ret:
-                continue
-            frame_bytes = buffer.tobytes()
-            # Yield frame in MJPEG format
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            await asyncio.sleep(1.0 / pipeline.fps)
-    return StreamingResponse(generate_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
+        raise HTTPException( status_code=500, detail=f"Error getting current state: {str(e)}")
 
 ## CAMERA ENDPOINTS
 # CAMERA CAPTURE (PHOTO)
@@ -477,7 +610,6 @@ async def delete_capture(filename: str):
     filepath = CAPTURE_DIR / filename
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    
     filepath.unlink()
     return {"status": "deleted", "filename": filename}
 
@@ -504,26 +636,42 @@ async def health_check():
 # ROOT ENDPOINT
 @app.get("/")
 def root():
+    """API root with endpoint documentation"""
     return {
         "message": "Raspberry Pi Control API",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
-            "camera": {
-                "capture": "POST /camera/capture",
-                "stream": "GET /camera/stream",
+            "servo": {
+                "move": "POST /servo/move"
             },
-            "utility": {
+            "database": {
+                "status": "GET /database/status",
+                "start": "POST /database/start",
+                "stop": "POST /database/stop",
+                "restart": "POST /database/restart",
+                "health": "GET /health/ai",
+            },
+            "pipeline": {
+                "status": "GET /pipeline/status",
+                "start": "POST /pipeline/start",
+                "stop": "POST /pipeline/stop",
+                "restart": "POST /pipeline/restart",
+                "modes": "GET /pipeline/modes",
+                "current_state": "GET /api/current/ai",
+            },
+            "ai_detection": {
+                "detections": "GET /api/detections?minutes=5&limit=100",
+                "statistics": "GET /api/statistics?hours=1",
+                "bulk_insert": "POST /api/detections/bulk"
+            },
+            "camera": {
+                "capture": "POST /camera/stream/capture",
+                "stream": "GET /camera/stream/snapshots",
+                "viewer": "GET /camera/stream/hls",
                 "list_captures": "GET /captures",
                 "delete_capture": "DELETE /captures/{filename}",
-                "health": "GET /health",
+                "health": "GET /health/camera",
             },
-            "AI_traffic_detection": {
-                "health": "/health/ai",
-                "detections": "/api/detections",
-                "statistics": "/api/statistics",
-                "websocket": "/ws/ai",
-                "video_stream": "/stream/ai"
-            }
         }
     }
 

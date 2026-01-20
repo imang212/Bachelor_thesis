@@ -12,6 +12,10 @@ This script demonstrates object detection and tracking using:
 - RTSP streaming (legacy support)
 - WebSocket for real-time data
 """
+import os
+os.environ["GST_PLUGIN_PATH"] = ""
+os.environ["GST_PLUGIN_SYSTEM_PATH"] = "/usr/lib/aarch64-linux-gnu/gstreamer-1.0"
+#os.environ["GST_PLUGIN_SCANNER"] = "/usr/lib/gstreamer-1.0/gst-plugin-scanner"
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -19,13 +23,11 @@ from gi.repository import Gst, GLib, GstRtspServer
 import json
 import threading
 import sys
-import os
 from datetime import datetime
 from collections import defaultdict
 from MQTTClient import MQTTPublisher
 from WebRTCStreamer import WebRTCStreamer
 from WebSocket import WebSocketServerWithDetectionData
-from SimpleTracker import SimpleTracker
 try:
     from hailo import get_roi_from_buffer, HAILO_DETECTION, HAILO_UNIQUE_ID
 except ImportError as e:
@@ -33,6 +35,7 @@ except ImportError as e:
 
 # Initialize GStreamer
 Gst.init(None)
+Gst.version()
 
 class VideoStatistics:
     """
@@ -43,6 +46,7 @@ class VideoStatistics:
         self.confidence_sum_per_class = defaultdict(float)
         self.total_frames = 0
         self.frames_with_detections = 0
+        self.object_counts = {"person": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "bicycle": 0}
         self.unique_track_ids = set()
         self.start_time = None
         self.end_time = None
@@ -51,7 +55,8 @@ class VideoStatistics:
         """Add a detection to statistics"""
         self.detections_per_class[class_name] += 1
         self.confidence_sum_per_class[class_name] += confidence
-        if track_id is not None:
+        if (track_id is not None and track_id not in self.unique_track_ids):
+            self.object_counts[class_name] += 1
             self.unique_track_ids.add(track_id)
     
     def add_frame(self, has_detections=False):
@@ -78,6 +83,7 @@ class VideoStatistics:
             avg_confidence = self.confidence_sum_per_class[class_name] / count if count > 0 else 0
             summary['detections_by_class'][class_name] = {
                 'count': count,
+                'real_object_count': self.object_counts[class_name],
                 'average_confidence': f"{avg_confidence:.4f}"
             }
         return summary
@@ -113,9 +119,12 @@ class DetectionData:
         self.frame_count = 0
         self.timestamp = None
         self.lock = threading.Lock()
-        self.last_sent_detections = None  # Track last sent data
         self.has_new_data = False  # Flag for new data
         self.debug = debug
+        # Track active objects by class
+        self.object_counts = {"person": 0, "car": 0, "truck": 0, "bus": 0, "motorcycle": 0, "bicycle": 0}
+        self.counted_track_ids = set()
+        self.total_count = 0
     
     def update(self, detections, frame_count):
         """
@@ -129,7 +138,14 @@ class DetectionData:
             self.frame_count = frame_count
             self.timestamp = datetime.now().isoformat()
             self.has_new_data = True
-            # Print detection summary every 60 frames
+            # Update active object counts
+            # Count unique tracked objects
+            for det in detections:
+                track_id = det.get('track_id')
+                if track_id is not None and track_id not in self.counted_track_ids:
+                    self.object_counts[det['class_name']] += 1
+                    self.counted_track_ids.add(track_id)
+                    self.total_count += 1
             if self.debug == True and self.frame_count % 60 == 0:
                 self._print_summary()
     
@@ -138,34 +154,23 @@ class DetectionData:
         Prints detection summary (called from within locked context)
         """
         print(f"\n[DETECTION SUMMARY Frame {self.frame_count}]")
-        print(f"  Total detections: {len(self.detections)}")
+        print(f"  Total active objects: {self.total_count}")
+        print(f"  Current frame detections: {len(self.detections)}")
         for idx, det in enumerate(self.detections):
             bbox_tuple = det['bbox']
             tracking_info = f"[ID:{det['track_id']}]" if det['track_id'] is not None else "[No ID]"
-            print(f"  [{idx}] {det['class_name']}: {det['confidence']:.2f} "
-                  f"@ bbox{bbox_tuple} {tracking_info}, time: {det['timestamp']}")
+            print(f"  [{idx}] {det['class_name']}: {det['confidence']:.2f} "f"@ bbox{bbox_tuple} {tracking_info}, time: {det['timestamp']}")
     
-    def get_json_if_new(self):
-        """
-        Returns detection data as JSON string only if it's new data
-        Returns None if no new data
-        """
+    def get_count_overlay_text(self):
+        """Returns formatted text for overlay display"""
         with self.lock:
-            if not self.has_new_data:
-                return None
-            data = {
-                'timestamp': self.timestamp,
-                'frame_count': self.frame_count,
-                'detections': self.detections
-            }
-            current_json = json.dumps(data)
-            # Check if data actually changed
-            if current_json == self.last_sent_detections:
-                return None
-            self.last_sent_detections = current_json
-            self.has_new_data = False
-            return current_json
-        
+            lines = [f"Total Objects: {self.total_count}"]
+            #for class_name in sorted(self.object_counts.keys()):
+            #    if self.object_counts[class_name] > 0:
+            #        count = self.object_counts[class_name]
+            #        lines.append(f"{class_name}: {count}")
+            return " | ".join(lines)
+    
     def get_json(self):
         """
         Returns detection data as JSON string
@@ -174,13 +179,25 @@ class DetectionData:
             data = {
                 'timestamp': self.timestamp,
                 'frame_count': self.frame_count,
-                'detections': self.detections
+                'detections': self.detections,
+                'active_counts': {
+                    'total': self.total_count,
+                    'by_class': {k: v for k, v in self.object_counts.items()}
+                }
             }
             return json.dumps(data)
     
     def get_dict(self):
         with self.lock:
-            return {'timestamp': self.timestamp, 'frame_count': self.frame_count, 'detections': self.detections}
+            return {
+                'timestamp': self.timestamp, 
+                'frame_count': self.frame_count, 
+                'detections': self.detections,
+                'active_counts': {
+                    'total': self.total_count,
+                    'by_class': {k: v for k, v in self.object_counts.items()}
+                }
+            }
 
 class RTSPServer:
     """
@@ -191,6 +208,8 @@ class RTSPServer:
         self.mount_point = mount_point
         self.server = None
         self.appsrc = None
+        self.appsrc_lock = threading.Lock()
+        self.is_ready = False
         
     def create_server(self):
         """
@@ -225,9 +244,36 @@ class RTSPServer:
     def on_media_configure(self, factory, media):
         """Called when media is configured - get the appsrc element"""
         element = media.get_element()
-        self.appsrc = element.get_child_by_name("mysrc")
-        if self.appsrc:
+        appsrc = element.get_child_by_name("mysrc")
+        if appsrc:
+            with self.appsrc_lock:
+                self.appsrc = appsrc
+                self.is_ready = False  # Will be ready when it reaches PLAYING state
+            # Connect to state-changed signal to detect when ready
+            element.connect("pad-added", self.on_pad_added)
             print("[INFO] RTSP appsrc configured")
+    
+    def on_pad_added(self, element, pad):
+        """Called when pad is added - indicates media is ready"""
+        with self.appsrc_lock:
+            self.is_ready = True
+    
+    def push_buffer(self, buffer):
+        """Thread-safe buffer push with state checking"""
+        with self.appsrc_lock:
+            if not self.appsrc:
+                return Gst.FlowReturn.OK
+            # Check appsrc state before pushing
+            state = self.appsrc.get_state(0)
+            if state[1] != Gst.State.PLAYING:
+                return Gst.FlowReturn.OK  # Silently skip if not playing
+            
+            try:
+                ret = self.appsrc.emit("push-buffer", buffer)
+                return ret
+            except Exception as e:
+                print(f"[ERROR] RTSP push-buffer exception: {e}")
+                return Gst.FlowReturn.ERROR
     
     def start(self):
         """
@@ -256,7 +302,7 @@ class HailoTrackerPipeline:
         self.enable_debug = enable_debug
         self.bus = None
         # Video analysis mode
-        self.video_mode = video_file is not None
+        self.video_mode = output_video_path is not None
         self.statistics = VideoStatistics() if self.video_mode else None
         # Detection data storage
         self.detection_data = DetectionData(debug=enable_debug)
@@ -272,13 +318,15 @@ class HailoTrackerPipeline:
         # MQTT publisher
         self.mqtt_publisher = None
         if enable_mqtt: self.mqtt_publisher = MQTTPublisher(broker_host="mqtt.portabo.cz", broker_port=8883, topic="/videoanalyza", client_id="hailo_tracker_client", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP")
-        # Tracker
-        self.tracker = SimpleTracker(max_lost_frames=30, iou_threshold=0.5)
         # frame count
         self.frame_count = 0
+        # Set of sent track IDs to avoid duplicates
+        self.sent_track_ids = set()
         # Recording
         self.recording_sink = None
-
+        # Dynamic overlay text for count display
+        self.count_overlay = ""
+        
     def create_pipeline(self):
         """
         Creates the GStreamer pipeline with the following flow:
@@ -314,13 +362,16 @@ class HailoTrackerPipeline:
                 "! h264parse "
                 "! avdec_h264 "
                 "! videoconvert "
+                "! videoscale "
+                "! video/x-raw,width=1920,height=1080 " 
+                "! videocrop top=440 left=320 right=960 bottom=0 "  # Crop to bottom-left 640x640
             )
         pipeline_str += (
             "! videoscale "
             "! video/x-raw,format=RGB "
             "! videoscale method=lanczos "
             "! video/x-raw, width=640, height=640 "
-            "! hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef batch-size=1 "
+            "! hailonet hef-path=/home/imang/tappas/apps/detection/resources/h8/yolov8m.hef batch-size=1 "
             "nms-score-threshold=0.5 nms-iou-threshold=0.5 name=hailonet "
             "! queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 "  # Add queue after hailonet
             "! hailofilter qos=false name=hailofilter function-name=yolov8m "
@@ -330,6 +381,7 @@ class HailoTrackerPipeline:
             "! hailotracker keep-past-metadata=true kalman-dist-thr=0.7 iou-thr=0.6 keep-new-frames=2 keep-tracked-frames=30 keep-lost-frames=10 name=hailotracker "
             "! hailooverlay show-confidence=true line-thickness=2 name=hailooverlay "
             "! textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' "
+            "! textoverlay text='Counting...' valignment=bottom halignment=left font-desc='Sans Bold 14' name=count_overlay "
             "! videoconvert "
             "! video/x-raw,format=I420 "
         )
@@ -365,11 +417,14 @@ class HailoTrackerPipeline:
             if self.enable_recording and self.output_video_path:
                 pipeline_str += (
                     "t. "
-                    "! queue leaky=downstream max-size-buffers=3 "
+                    "! queue max-size-buffers=30 "
                     "! videoconvert "
+                    "! videorate "
                     "! video/x-raw,format=I420 "
-                    "! x264enc tune=zerolatency bitrate=4000 speed-preset=medium "
-                    f"! mp4mux ! filesink location={self.output_video_path} name=recording_sink "
+                    "! x264enc tune=zerolatency bitrate=4000 speed-preset=medium key-int-max=30 "
+                    "! h264parse "
+                    "! mp4mux fragment-duration=1000 streamable=true "
+                    f"! filesink location={self.output_video_path} sync=false name=recording_sink "
                 )
                 branches_added = True
                 print(f"[INFO] Recording enabled, output: {self.output_video_path}")
@@ -392,7 +447,10 @@ class HailoTrackerPipeline:
         except Exception as e:
             print(f"[ERROR] Failed to create pipeline: {e}")
             return
-        hailofilter = self.pipeline.get_by_name('hailofilter') # Get the hailofilter element to extract detection data
+        # Get the count overlay element
+        self.count_overlay = self.pipeline.get_by_name('count_overlay')
+        # Set up buffer probe on hailofilter to extract detection metadata
+        hailofilter = self.pipeline.get_by_name('hailotracker') # Get the hailofilter element to extract detection data
         if hailofilter:
             pad = hailofilter.get_static_pad('src') # Connect to the pad to intercept metadata
             if pad:
@@ -403,7 +461,8 @@ class HailoTrackerPipeline:
         self.bus = self.pipeline.get_bus() # Connect to the bus to handle messages
         self.bus.add_signal_watch() 
         self.bus.connect("message", self.on_message)
-        
+        return True
+
     def buffer_probe_callback(self, pad, info):
         """
         Callback function to extract detection metadata from GStreamer buffers
@@ -422,7 +481,6 @@ class HailoTrackerPipeline:
         hailo_detections = roi.get_objects_typed(HAILO_DETECTION)
         # Prepare detection list
         detection_list = []
-        # Get current timestamp
         current_timestamp = datetime.now().isoformat()
         # Process each detection
         for detection in hailo_detections:
@@ -437,84 +495,47 @@ class HailoTrackerPipeline:
                 float(bbox.ymin() + bbox.height())
             ]
             # Get tracking ID if available
-            #track = detection.get_objects_typed(HAILO_UNIQUE_ID)
-            #if len(track) == 1: tracking_id = track[0].get_id()
-            if label in ["car", "motorcycle", "bicycle", "truck", "bus", "person"]:  # Threshold for valid detections
-                #Create detection dictionary
-                detection_dict = {
-                    'class_id': class_id,
-                    'class_name': label,
-                    'confidence': float(confidence),
-                    'bbox': bbox_coords,
-                    #'tracking_id': tracking_id if tracking_id is not None else None,
-                    'timestamp': current_timestamp
-                }
-                detection_list.append(detection_dict)
-                #print(f"Label: {label}, Confidence: {confidence:.2f}")
-                #print(f"BBox: x={bbox.xmin()}, y={bbox.ymin()}, "
-                #      f"width={bbox.width()}, height={bbox.height()}")
+            tracking_id = None
+            track = detection.get_objects_typed(HAILO_UNIQUE_ID)
+            if len(track) == 1: tracking_id = track[0].get_id()
+            # Filter by class (only vehicles and persons)
+            if label not in ["car", "motorcycle", "bicycle", "truck", "bus", "person"]:  # Threshold for valid detections
+                #print(f"[DEBUG] Skipping detection with label(not vehicle): {label}")
+                continue
+            # Avoid sending duplicate track IDs
+            if tracking_id in self.sent_track_ids:
+                continue
+            # Create detection dictionary
+            detection_dict = {
+                'class_id': class_id,
+                'class_name': label,
+                'confidence': float(confidence),
+                'bbox': bbox_coords,
+                'track_id': tracking_id if tracking_id is not None else None,
+                'timestamp': current_timestamp
+            }
+            detection_list.append(detection_dict)
+            # Update detection data with tracked objects
+            self.detection_data.update(detection_list, self.frame_count)
+            # Publish to MQTT
+            if detection_list and self.enable_mqtt and self.mqtt_publisher and self.mqtt_publisher.connected:
+                data_dict = self.detection_data.get_dict()
+                self.mqtt_publisher.publish(data_dict)
+                self.sent_track_ids.add(tracking_id)  # ONLY after publish
+            # Debug print
+            if self.enable_debug:
+                print(f"Label: {label}, Confidence: {confidence:.2f}, BBox: {bbox_coords}, Track ID: {tracking_id}")
+        
         self.frame_count += 1
+        # Update counting overlay every frame
+        if self.count_overlay:
+            overlay_text = self.detection_data.get_count_overlay_text()
+            self.count_overlay.set_property('text', overlay_text)
         # Update statistics if in video mode
         if self.statistics:
             self.statistics.add_frame(has_detections=len(detection_list) > 0)
-        # update tracker with new detections per frame
-        tracks = self.tracker.update(detection_list)
-        # Update detection data every 30 frames from tracked objects
-        if self.frame_count % 30 == 0:
-            self.detection_data.update(tracks, self.frame_count)
-            # Update statistics with tracked objects
-            if self.statistics:
-                for track in tracks:
-                    self.statistics.add_detection(
-                        track['class_name'],
-                        track['confidence'],
-                        track.get('track_id')
-                    )
-            # Publish to MQTT
-            if self.enable_mqtt and self.mqtt_publisher and self.mqtt_publisher.connected:
-                data_dict = self.detection_data.get_dict()
-                self.mqtt_publisher.publish(data_dict)
-            ## CREATE saving tracked detections to db
-            ## Prepare batch detections for database
-            #db_detections = []; track_ids_to_check = []
-            #for tracked_detection in self.detection_data:
-            #    track_id = tracked_detection.get('tracking_id', -1)
-            #    # Skip invalid track_ids
-            #    if track_id == -1 or track_id is None:
-            #        continue
-            #    track_ids_to_check.append(track_id)
-            #    # Create detection record for database
-            #    db_detection = {
-            #        'timestamp': current_timestamp,
-            #        'frame_id': self.frame_count,
-            #        'label': tracked_detection.get('class_name', 'unknown'),
-            #        'confidence': tracked_detection.get('confidence', 0.0),
-            #        'x1': int(tracked_detection.get('bbox', [0, 0, 0, 0])[0]),
-            #        'y1': int(tracked_detection.get('bbox', [0, 0, 0, 0])[1]),
-            #        'x2': int(tracked_detection.get('bbox', [0, 0, 0, 0])[2]),
-            #        'y2': int(tracked_detection.get('bbox', [0, 0, 0, 0])[3]),
-            #        'track_id': track_id,
-            #        'total_count': len(self.detection_data)
-            #    }
-            #    db_detections.append(db_detection)
-            ## Check which track_ids already exist in database (batch check for efficiency)
-            #if db_detections and hasattr(self, 'db_manager'):
-            #    try:
-            #        existing_track_ids = self.db_manager.get_existing_track_ids(track_ids_to_check)
-            #        # Filter out detections with existing track_ids
-            #        new_detections = [
-            #            det for det in db_detections 
-            #            if det['track_id'] not in existing_track_ids
-            #        ]
-            #        # Insert only new detections
-            #        if new_detections:
-            #            self.db_manager.insert_batch_detections(new_detections)
-            #            print(f"[Database] Inserted {len(new_detections)} new detections at frame {self.frame_count}")
-            #            print(f"[Database] Skipped {len(db_detections) - len(new_detections)} detections with existing track_ids")
-            #        else:
-            #            print(f"[Database] All {len(db_detections)} track_ids already exist, skipped insertion")
-            #    except Exception as e:
-            #        print(f"[Database] Error inserting detections: {e}")        
+            for det in detection_list:
+                self.statistics.add_detection(det['class_name'], det['confidence'], det.get('track_id'))
         return Gst.PadProbeReturn.OK
     
     def on_message(self, bus, message):
@@ -536,12 +557,12 @@ class HailoTrackerPipeline:
         """Callback for appsink - pushes buffers to RTSP server"""
         try:
             sample = appsink.emit("pull-sample")
-            if sample and self.rtsp_server and self.rtsp_server.appsrc:
-                # Push the buffer to RTSP appsrc
+            if sample and self.rtsp_server:
                 buffer = sample.get_buffer()
-                ret = self.rtsp_server.appsrc.emit("push-buffer", buffer)
-                if ret != Gst.FlowReturn.OK:
-                    print(f"[WARNING] RTSP push-buffer returned: {ret}")
+                ret = self.rtsp_server.push_buffer(buffer)
+                # Only warn on actual errors, not FLUSHING
+                if ret == Gst.FlowReturn.ERROR:
+                    print(f"[ERROR] RTSP push-buffer failed")
             return Gst.FlowReturn.OK
         except Exception as e:
             print(f"[ERROR] RTSP sample callback error: {e}")
@@ -614,22 +635,41 @@ class HailoTrackerPipeline:
         print("Stopping pipeline...")
         # Stop the pipeline
         if self.pipeline:
+            # Send EOS to ensure proper file finalization
+            print("[INFO] Sending End-of-Stream signal...")
+            self.pipeline.send_event(Gst.Event.new_eos())    
+            # Wait for EOS to propagate through pipeline
+            bus = self.pipeline.get_bus()
+            # Set timeout to 5 seconds
+            msg = bus.timed_pop_filtered(
+                5 * Gst.SECOND,
+                Gst.MessageType.EOS | Gst.MessageType.ERROR
+            )
+            if msg:
+                if msg.type == Gst.MessageType.EOS:
+                    print("[INFO] EOS received, file finalized properly")
+                elif msg.type == Gst.MessageType.ERROR:
+                    err, debug = msg.parse_error()
+                    print(f"[WARNING] Error during shutdown: {err}")
+            else:
+                print("[WARNING] EOS timeout - forcing shutdown")
+            # Now set to NULL state
             self.pipeline.set_state(Gst.State.NULL)
+        # Print statistics if in video mode
+            if self.statistics:
+                summary = self.statistics.print_summary()    
+                # Save statistics to JSON file
+                if self.output_video_path:
+                    stats_file = self.output_video_path.rsplit('.', 1)[0] + '_statistics.json'
+                    with open(stats_file, 'w') as f:
+                        json.dump(summary, f, indent=2)
+                    print(f"Statistics saved to: {stats_file}")
         # disconnect form mgtt
         if self.mqtt_publisher:
             self.mqtt_publisher.disconnect()
         # Quit the main loop
         if self.loop:
             self.loop.quit()
-        # Print statistics if in video mode
-        if self.statistics:
-            summary = self.statistics.print_summary()    
-            # Save statistics to JSON file
-            if self.video_file:
-                stats_file = self.video_file.rsplit('.', 1)[0] + '_statistics.json'
-                with open(stats_file, 'w') as f:
-                    json.dump(summary, f, indent=2)
-                print(f"Statistics saved to: {stats_file}")
         print("Pipeline stopped")
     
     def get_statistics(self):
@@ -640,9 +680,6 @@ def main():
     """
     Main entry point for the application
     """
-    # rpicamera=True, video_file=None, enable_rtsp=True, 
-    #             enable_websocket=True, enable_webrtc=False, enable_mqtt=True, 
-    #             enable_recording=False, output_video_path=None, enable_debug=True
     import argparse
     parser = argparse.ArgumentParser(description='Hailo Detection Pipeline')
     parser.add_argument('--rpicamera', action='store_true', help='Use RPi camera stream (IP camera 192.168.37.99 stream default)')
@@ -654,6 +691,7 @@ def main():
     parser.add_argument('--enable-recording', action='store_true', help='Enable recording output video (default False)')
     parser.add_argument('--output-path', type=str, help='Output video file path if recording is enabled')
     parser.add_argument('--debug', action='store_true', help='Enable debug output (default False)')
+
     args = parser.parse_args()
     print("=" * 60)
     print("Hailo Tracker Pipeline - Raspberry Pi AI HAT+ (26 TOPS)")
@@ -693,7 +731,7 @@ def main():
         enable_mqtt=args.enable_mqtt,
         enable_recording=args.enable_recording,
         output_video_path=output_path,
-        enable_debug=args.debug
+        enable_debug=args.debug,
     )
     tracker.create_pipeline()
     tracker.start()
@@ -777,93 +815,4 @@ python3 hailo_tracker.py
 Then connect to:
 - RTSP: rtsp://raspberry-pi-ip:8554/hailo_stream
 - WebSocket: ws://raspberry-pi-ip:8765
-
-GStreamer console testing commands:
-gst-launch-1.0 \
-  libcamerasrc ! \
-  video/x-raw,format=NV12,width=1536,height=864,framerate=30/1 ! \
-  videoconvert ! \
-  videoscale ! \
-  video/x-raw,format=RGB, width=640,height=640 ! \
-  hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef name=hailonet ! \
-  hailofilter function-name=yolov8 \
-    config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json \
-    name=hailofilter ! \
-  hailotracker kalman-dist-thr=0.7 iou-thr=0.3 keep-tracked-frames=30 keep-new-frames=3 keep-lost-frames=10 name=hailotracker ! \
-  hailooverlay show-confidence=true line-thickness=2 name=hailooverlay ! \
-  textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' ! \
-  videoconvert ! \
-  video/x-raw,format=I420 ! \
-  tee name=t \
-    t. ! queue ! fakesink
-
-Test with rtsp:
-gst-launch-1.0 \
-  libcamerasrc ! \
-  video/x-raw,format=NV12,width=1536,height=864,framerate=30/1 ! \
-  videoconvert ! \
-  videoscale ! \
-  video/x-raw,format=RGB, width=640, height=640 ! \
-  hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef name=hailonet ! \
-  hailofilter function-name=yolov8 \
-    config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json \
-    name=hailofilter ! \
-  hailotracker kalman-dist-thr=0.7 iou-thr=0.3 keep-tracked-frames=30 keep-new-frames=3 keep-lost-frames=10 
-  name=hailotracker ! \
-  hailooverlay show-confidence=true line-thickness=2 name=hailooverlay ! \
-  textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' ! \
-  videoconvert ! \
-  video/x-raw,format=I420 ! \
-  tee name=t \
-     t. ! queue ! videoconvert ! video/x-raw,format=I420,width=1536,height=864 ! appsink name=rtsp_sink emit-signals=true sync=false \
-      t. ! queue ! fakesink
-
-Small test:  
-  gst-launch-1.0 \
-  libcamerasrc ! video/x-raw,format=NV12,width=1536,height=864,framerate=30/1 ! \
-  videoconvert ! video/x-raw ! videoscale ! video/x-raw,width=640,height=640 ! \
-  hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef name=hailonet ! \
-  hailofilter function-name=yolov8 \
-    config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json \
-    so-path=/home/imang/hailo-rpi5-examples/resources/so/libyolov8_postprocess.so \
-    name=hailofilter ! \
-  fakesink
-
-Test with window:
-gst-launch-1.0 \
-  rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Stream" latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! \
-  videoconvert ! \
-  videoscale ! \
-  video/x-raw,format=RGB,width=640,height=640 ! \
-  hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef batch-size=1 ! \
-  queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 ! \
-  hailofilter function-name=yolov8m \
-    so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so \
-    qos=false ! \
-  queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 ! \
-  hailotracker kalman-dist-thr=0.7 iou-thr=0.3 keep-tracked-frames=30 keep-new-frames=3 keep-lost-frames=10 ! \
-  hailooverlay show-confidence=true line-thickness=2 ! \
-  textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' ! \
-  videoconvert ! \
-  autovideosink
-
-GStreamer test
-gst-launch-1.0 \
-    rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Stream" latency=0 ! \
-    rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! \
-    videoscale ! \
-    video/x-raw,format=RGB, width=640,height=640 ! \
-    hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef name=hailonet ! \
-    hailofilter function-name=yolov8 \
-        config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json \
-        name=hailofilter ! \
-    hailotracker kalman-dist-thr=0.7 iou-thr=0.3 keep-tracked-frames=30 keep-new-frames=3 keep-lost-frames=10 name=hailotracker ! \
-    hailooverlay show-confidence=true line-thickness=2 name=hailooverlay ! \
-    textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' ! \
-    autovideosink !
-
-Launch RSTP stream from camera:
-gst-launch-1.0 -v rtspsrc location=rtsp://192.168.37.205:8554/hailo_stream latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
-Launch real stream from camera:
-gst-launch-1.0 rtspsrc location="rtsp://admin:Dcuk.123456@192.168.37.99/Streaming/Channels" latency=0 !   rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! autovideosink
 """

@@ -4,6 +4,16 @@
 
 #### Install required modules
 ```bash
+sudo apt-get update && apt-get install -y 
+    python3 \ python3-venv \ python3-pip \ python3-dev \ python3-setuptools \ python3-virtualenv \
+    build-essential \ cmake \ git \ wget \ pkg-config \
+    libopenblas-dev \ libopencv-dev \ python3-opencv \ libatlas-base-dev \ gfortran \
+    libjpeg-dev \ libpng-dev \ libavcodec-dev \ libavformat-dev \ libswscale-dev \ 
+    libv4l-dev \ libxvidcore-dev \ libx264-dev \ libhdf5-dev \ libhdf5-serial-dev \
+    libcap-dev \ libarchive-dev \ libavdevice-dev \ libavutil-dev \ libswresample-dev \
+    libfreetype6 \ libcamera0 \ rsync \ ffmpeg \ x11-utils \
+    python-gi-dev \ libgirepository1.0-dev \ gcc-12 \ g++-12 \ libzmq3-dev \ pkg-config \ libcairo2-dev \ libgirepository1.0-dev \ libgstreamer1.0-dev \ libgstreamer-plugins-base1.0-dev \ libgstreamer-plugins-bad1.0-dev \ gstreamer1.0-plugins-base \ gstreamer1.0-plugins-good \ gstreamer1.0-plugins-bad \ gstreamer1.0-plugins-ugly \ gstreamer1.0-libav \ gstreamer1.0-tools \ gstreamer1.0-x \  gstreamer1.0-alsa \ gstreamer1.0-gl \ gstreamer1.0-gtk3 \ gstreamer1.0-qt5 \ gstreamer1.0-pulseaudio \ gcc-12 \ g++-12 \ python-gi-dev \ gstreamer1.0-* \ python3-gi \ python3-gi-cairo \ gir1.2-gtk-3.0
+
 # Required modules
 sudo apt-get install -y rsync ffmpeg x11-utils python3-dev python3-pip python3-setuptools python3-virtualenv python-gi-dev libgirepository1.0-dev gcc-12 g++-12 cmake git libzmq3-dev pkg-config
 
@@ -14,6 +24,12 @@ sudo apt-get install -y gstreamer1.0-*
 
 #PyGobject
 sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
+
+# Install RTSP plugins
+sudo apt-get install -y gir1.2-gst-rtsp-server-1.0 gir1.2-gstreamer-1.0
+
+# Install mqtt plugin
+sudo apt install -y python3-paho-mqtt
 ```
 
 #### PciE driver installation
@@ -49,16 +65,20 @@ git clone https://github.com/hailo-ai/hailort.git hailort/sources
 ```bash
 #cache clear
 rm -rf ~/.cache/gstreamer-1.0/
-rm /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/libgsthailotools.so
+sudo rm -rf /root/.cache/gstreamer-1.0
+sudo rm /usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0/libgsthailotools.so
 
 #installation
-sudo ./install.sh --skip-hailort --target-platform rockchip
+sudo ./install.sh --skip-hailort
 
 # find the file
 find /usr -name "libgsthailometa.so*"
 
 # bad file mapping path repair 
-sudo ln -s /usr/lib/aarch64-linux-gnu/libgsthailometa.so.5 /usr/lib/aarch64-linux-gnu/libgsthailometa.so.3
+sudo ln -s /usr/lib/aarch64-linux-gnu/libgsthailometa.so.5.2.0 /usr/lib/aarch64-linux-gnu/libgsthailometa.so.3
+
+unset $GST_PLUGIN_PATH
+unset $LD_LIBRARY_PATH
 
 # Check drivers are loaded
 lsmod | grep hailo
