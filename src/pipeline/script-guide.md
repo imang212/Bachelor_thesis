@@ -29,7 +29,7 @@ sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0
 sudo apt-get install -y gir1.2-gst-rtsp-server-1.0 gir1.2-gstreamer-1.0
 
 # Install mqtt plugin
-sudo apt install -y python3-paho-mqtt
+sudo apt install -y python3-paho-mqtt python3-websockets
 ```
 
 #### PciE driver installation
@@ -107,6 +107,8 @@ python3 AI_traffic_detection_hailo/DetectionWithGStreamer_pipeline.py --video ou
 
 # Live IP camera with recording
 python3 DetectionWithGStreamer_pipeline.py --enable-recording --output live_recording.mp4
+
+python3 DetectionWithGStreamer_pipeline.py --enable-recording --output live_recording.mp4 --enable-mqtt
 
 ### Full features enabled
 python3 DetectionWithGStreamer_pipeline.py --video test.mp4 --enable-recording --enable-mqtt

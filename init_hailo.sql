@@ -14,7 +14,6 @@ WHERE NOT EXISTS (
     SELECT FROM pg_database WHERE datname = 'hailo_db'
 )\gexec
 
-
 -- Connect to hailo_db
 \connect hailo_db;
 
