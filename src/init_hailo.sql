@@ -24,10 +24,10 @@ CREATE TABLE IF NOT EXISTS detections (
     frame_id INTEGER NOT NULL,
     class_name TEXT NOT NULL,
     confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
-    x1 FLOAT NOT NULL CHECK (x1 >= 0),
-    y1 FLOAT NOT NULL CHECK (y1 >= 0),
-    x2 FLOAT NOT NULL CHECK (x2 >= 0),
-    y2 FLOAT NOT NULL CHECK (y2 >= 0),
+    x1 FLOAT NOT NULL,
+    y1 FLOAT NOT NULL,
+    x2 FLOAT NOT NULL,
+    y2 FLOAT NOT NULL,
     track_id INT,
     CHECK (x2 > x1 AND y2 > y1)  
 );

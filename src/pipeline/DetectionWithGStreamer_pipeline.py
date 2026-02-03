@@ -1,21 +1,20 @@
-#!/usr/bin/env python3
 """
 GStreamer Pipeline with Hailo Tracker for Raspberry Pi AI HAT+ (26 TOPS)
 =========================================================================
 This script demonstrates object detection and tracking using:
-- IMX708 camera via rpicam-apps
+- IMX708 camera via rpicam-apps or IP camera RTSP stream
 - YOLOv8m model for detection
 - Hailo HW accelerator for inference
 - hailotracker for object tracking
-- WebRTC streaming (browser-compatible)
-- MQTT protocol for detection data
 - RTSP streaming (legacy support)
-- WebSocket for real-time data
+- WebRTC streaming (browser-compatible)
+- MQTT protocol for detection data sending
+- WebSocket for real-time data sending
+- Video recording mode for video analysis with statistics generation
 """
 import os
 os.environ["GST_PLUGIN_PATH"] = ""
 os.environ["GST_PLUGIN_SYSTEM_PATH"] = "/usr/lib/aarch64-linux-gnu/gstreamer-1.0"
-#os.environ["GST_PLUGIN_SCANNER"] = "/usr/lib/gstreamer-1.0/gst-plugin-scanner"
 import gi
 gi.require_version('Gst', '1.0')
 gi.require_version('GstRtspServer', '1.0')
@@ -26,8 +25,8 @@ import sys
 from datetime import datetime
 from collections import defaultdict
 from MQTTClient import MQTTPublisher
-from WebRTCStreamer import WebRTCStreamer
 from WebSocket import WebSocketServerWithDetectionData
+import numpy as np
 try:
     from hailo import get_roi_from_buffer, HAILO_DETECTION, HAILO_UNIQUE_ID
 except ImportError as e:
@@ -72,6 +71,7 @@ class VideoStatistics:
             'frames_with_detections': self.frames_with_detections,
             'unique_objects_tracked': len(self.unique_track_ids),
             'processing_time': None,
+            'fps': "n/a",
             'detections_by_class': {}
         }        
         if self.start_time and self.end_time:
@@ -112,7 +112,7 @@ class VideoStatistics:
 
 class DetectionData:
     """
-    Stores detection and tracking data to be sent via WebSocket
+    Stores actual detection and tracking data
     """
     def __init__(self, debug=True):
         self.detections = []
@@ -201,7 +201,7 @@ class DetectionData:
 
 class RTSPServer:
     """
-    RTSP server to stream the processed video with detections and tracking
+    RTSP server to stream the processed video from pipeline with detections and tracking
     """
     def __init__(self, port=8554, mount_point="/hailo_stream"):
         self.port = port
@@ -286,16 +286,16 @@ class HailoTrackerPipeline:
     """
     Main class for managing the GStreamer pipeline with Hailo detection and tracking.
     """
-    def __init__(self, rpicamera=False, video_file=None, enable_rtsp=False, 
-                 enable_websocket=False, enable_webrtc=False, enable_mqtt=False, 
-                 enable_recording=False, output_video_path=None, enable_debug=False):
+    def __init__(self, rpicamera=False, rtsp_link=None, video_file=None, enable_rtsp=False, 
+                 enable_websocket=False, enable_mqtt=False, enable_recording=False, 
+                 output_video_path=None, enable_debug=False):
         self.pipeline = None
         self.loop = None
         self.rpicamera = rpicamera
+        self.rtsp_link = rtsp_link
         self.video_file = video_file
         self.enable_rtsp = enable_rtsp
         self.enable_websocket = enable_websocket
-        self.enable_webrtc = enable_webrtc
         self.enable_mqtt = enable_mqtt
         self.enable_recording = enable_recording
         self.output_video_path = output_video_path
@@ -303,6 +303,7 @@ class HailoTrackerPipeline:
         self.bus = None
         # Video analysis mode
         self.video_mode = output_video_path is not None
+        # Statistics for video analysis
         self.statistics = VideoStatistics() if self.video_mode else None
         # Detection data storage
         self.detection_data = DetectionData(debug=enable_debug)
@@ -312,9 +313,6 @@ class HailoTrackerPipeline:
         # WebSocket server
         self.websocket_server = None
         if enable_websocket: self.websocket_server = WebSocketServerWithDetectionData(detection_data=self.detection_data, host="0.0.0.0", port=8765)
-        # WebRTC streamer
-        self.webrtc_streamer = None
-        if enable_webrtc: self.webrtc_streamer = WebRTCStreamer()
         # MQTT publisher
         self.mqtt_publisher = None
         if enable_mqtt: self.mqtt_publisher = MQTTPublisher(broker_host="mqtt.portabo.cz", broker_port=8883, topic="/videoanalyza", client_id="hailo_tracker_client", username="videoanalyza", password="phdA9ZNW1vfkXdJkhhbP")
@@ -325,19 +323,21 @@ class HailoTrackerPipeline:
         # Recording
         self.recording_sink = None
         # Dynamic overlay text for count display
-        self.count_overlay = ""
+        self.count_overlay = ""  
+        # Running flag
+        self.running = False
         
     def create_pipeline(self):
         """
         Creates the GStreamer pipeline with the following flow:
-        1. libcamerasrc - Captures video from IMX708 camera
+        1. libcamerasrc, rstpsrc - Captures video from raspberry IMX camera or RTSP source
         2. capsfilter - Sets video format and resolution
         3. videoconvert - Converts color format if needed
         4. hailonet - Runs YOLOv8m detection on Hailo accelerator
         5. hailofilter - Post-processes detection results
         6. hailotracker - Tracks detected objects across frames
         7. hailooverlay - Draws bounding boxes and tracking IDs
-        8. videoconvert - Prepares for display/encoding
+        8. videoconvert - Prepares for display/encoding, RSTP/video recording
         """ 
         # Define the video source based on mode
         if self.video_file:
@@ -348,6 +348,7 @@ class HailoTrackerPipeline:
                 f"filesrc location={self.video_file} "
                 "! decodebin "
                 "! videoconvert "
+                "! videoscale "
             )
         elif self.rpicamera:
             pipeline_str = (
@@ -356,36 +357,35 @@ class HailoTrackerPipeline:
                 "! videoconvert "
             )
         else:
+            if self.rtsp_link is None:
+                self.rtsp_link = "admin:Dcuk.123456@192.168.37.99/Stream"
             pipeline_str = (
-                "rtspsrc location=rtsp://admin:Dcuk.123456@192.168.37.99/Stream latency=0 "
+                f"rtspsrc location=rtsp://{self.rtsp_link} latency=150 drop-on-latency=true "
                 "! rtph264depay "
                 "! h264parse "
                 "! avdec_h264 "
                 "! videoconvert "
                 "! videoscale "
-                "! video/x-raw,width=1920,height=1080 " 
-                "! videocrop top=440 left=320 right=960 bottom=0 "  # Crop to bottom-left 640x640
+                "! video/x-raw,width=1280,height=720,format=RGB " 
+                "! videocrop top=80 left=200 right=440 bottom=0 "  # Crop to bottom-left 640x640, top=440 left=320 right=960 bottom=0 for fullhd
             )
         pipeline_str += (
-            "! videoscale "
-            "! video/x-raw,format=RGB "
             "! videoscale method=lanczos "
-            "! video/x-raw, width=640, height=640 "
+            "! video/x-raw,width=640,height=640,format=RGB "
             "! hailonet hef-path=/home/imang/tappas/apps/detection/resources/h8/yolov8m.hef batch-size=1 "
-            "nms-score-threshold=0.5 nms-iou-threshold=0.5 name=hailonet "
-            "! queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 "  # Add queue after hailonet
+            "nms-score-threshold=0.6 nms-iou-threshold=0.5 name=hailonet "
+            "! queue leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # allow some leakiness before hailofilter
             "! hailofilter qos=false name=hailofilter function-name=yolov8m "
-            #"config-path=/home/imang/hailo_model_zoo/hailo_model_zoo/cfg/postprocess_config/yolov8m_nms_config.json "
             "so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so "
-            "! queue leaky=no max-size-buffers=30 max-size-bytes=0 max-size-time=0 " # Add queue after hailofilter
-            "! hailotracker keep-past-metadata=true kalman-dist-thr=0.7 iou-thr=0.6 keep-new-frames=2 keep-tracked-frames=30 keep-lost-frames=10 name=hailotracker "
+            "! queue leaky=no max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # After hailofilter, keep tight 
+            "! hailotracker keep-past-metadata=true kalman-dist-thr=0.85 iou-thr=0.5 keep-new-frames=5 keep-tracked-frames=45 keep-lost-frames=20 name=hailotracker "
             "! hailooverlay show-confidence=true line-thickness=2 name=hailooverlay "
             "! textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' "
             "! textoverlay text='Counting...' valignment=bottom halignment=left font-desc='Sans Bold 14' name=count_overlay "
             "! videoconvert "
             "! video/x-raw,format=I420 "
         )
-        if self.enable_rtsp or self.enable_webrtc or self.enable_recording:
+        if self.enable_rtsp or self.enable_recording:
             pipeline_str += "! tee name=t "
             branches_added = False
             # RTSP branch
@@ -400,19 +400,6 @@ class HailoTrackerPipeline:
                     "! appsink name=rtsp_sink emit-signals=true sync=false drop=true max-buffers=1 "
                  )
                 branches_added = True
-            # WebRTC branch
-            if self.enable_webrtc:
-                pipeline_str += (
-                    "t. "
-                    "! queue leaky=downstream max-size-buffers=3 "
-                    "! videoconvert "
-                    "! video/x-raw,format=I420,width=640,height=640,framerate=30/1 "
-                    "! vp8enc deadline=1 target-bitrate=2000000 cpu-used=4 "
-                    "! rtpvp8pay pt=96 "
-                    "! application/x-rtp,media=video,encoding-name=VP8,payload=96 "
-                    "! webrtcbin name=webrtcbin stun-server=stun://stun.l.google.com:19302 "
-                )
-                branches_added = True    
             # Recording branch
             if self.enable_recording and self.output_video_path:
                 pipeline_str += (
@@ -447,25 +434,26 @@ class HailoTrackerPipeline:
         except Exception as e:
             print(f"[ERROR] Failed to create pipeline: {e}")
             return
-        # Get the count overlay element
+         # Get the count overlay element
         self.count_overlay = self.pipeline.get_by_name('count_overlay')
         # Set up buffer probe on hailofilter to extract detection metadata
-        hailofilter = self.pipeline.get_by_name('hailotracker') # Get the hailofilter element to extract detection data
-        if hailofilter:
-            pad = hailofilter.get_static_pad('src') # Connect to the pad to intercept metadata
+        hailotracker = self.pipeline.get_by_name('hailotracker') # Get the hailofilter element to extract detection data
+        if hailotracker:
+            pad = hailotracker.get_static_pad('src') # Connect to the pad to intercept metadata
             if pad:
                 pad.add_probe(Gst.PadProbeType.BUFFER, self.buffer_probe_callback)
         else:
             print("[WARNING] Could not find hailofilter element")
-            
+        # Set up bus to handle messages
         self.bus = self.pipeline.get_bus() # Connect to the bus to handle messages
         self.bus.add_signal_watch() 
         self.bus.connect("message", self.on_message)
-        return True
+        # Set running flag to True
+        self.running = True
 
     def buffer_probe_callback(self, pad, info):
         """
-        Callback function to extract detection metadata from GStreamer buffers
+        Callback function to extract detection and tracker metadata from GStreamer buffers
         This is called for each frame passing through the pipeline
         Args:
             pad: GStreamer pad object
@@ -494,6 +482,14 @@ class HailoTrackerPipeline:
                 float(bbox.xmin() + bbox.width()),
                 float(bbox.ymin() + bbox.height())
             ]
+            # check zone
+            cx = (bbox.xmin() + bbox.width() * 0.5)
+            cy = (bbox.ymin() + bbox.height() * 0.5) 
+            # filter zone
+            in_zone = (0.15 <= cx <= 0.5 and 0.85 <= cy <= 0.99)
+            if not in_zone:
+                #print(f"y={cy} not in zone")
+                continue
             # Get tracking ID if available
             tracking_id = None
             track = detection.get_objects_typed(HAILO_UNIQUE_ID)
@@ -544,7 +540,9 @@ class HailoTrackerPipeline:
         """
         t = message.type
         if t == Gst.MessageType.EOS: 
-            print("[Pipeline] End of stream reached"); self.stop()
+            print("[Pipeline] End of stream reached")
+            if self.video_file: 
+                self.stop()
         elif t == Gst.MessageType.ERROR: 
             err, debug = message.parse_error(); print(f"[Pipeline] Error: {err}"); print(f"[Pipeline] Debug info: {debug}"); self.stop()
         elif t == Gst.MessageType.WARNING: 
@@ -568,36 +566,33 @@ class HailoTrackerPipeline:
             print(f"[ERROR] RTSP sample callback error: {e}")
             return Gst.FlowReturn.ERROR
     
+    
+
+
     def start(self):
         """
-        Starts the pipeline, RTSP server, and WebSocket server
+        Starts the pipeline with all configured features
         """
-        if self.video_mode:
-            print(f"[Pipeline] Starting Video Analysis Mode: {self.video_file}")
+        # Create the pipeline for video analysis or live tracking
+        if self.video_mode and self.output_video_path:
+            print(f"[Pipeline] Starting Video Analysis Mode...")
             if self.statistics:
                 self.statistics.start_time = datetime.now()
         else:
             print("[Pipeline] Starting Hailo Tracker Pipeline...")
-
+        # connect to mqtt broker
         if self.enable_mqtt and self.mqtt_publisher:
             self.mqtt_publisher.connect()
-
+        # Create the pipeline for rtsp streaming
         if self.enable_rtsp and self.rtsp_server:
             rtsp_sink = self.pipeline.get_by_name('rtsp_sink')
             if rtsp_sink:
                 rtsp_sink.connect("new-sample", self.on_new_sample_rtsp)
                 print("[INFO] RTSP sink connected")
-        
+        # Start WebSocket server
         if self.enable_websocket and self.websocket_server:
             ws_thread = threading.Thread(target=self.websocket_server.run, daemon=True)
-            ws_thread.start()
-        
-        if self.enable_webrtc and self.webrtc_streamer:
-            # Start signaling after pipeline is ready
-            self.webrtc_streamer.create_webrtc_pipeline(self.pipeline)
-            self.webrtc_streamer.start_signaling("hailo-stream")
-            print("[INFO] WebRTC signalling started")
-            
+            ws_thread.start()    
         # Set pipeline to PLAYING state
         ret = self.pipeline.set_state(Gst.State.PLAYING)
         if ret == Gst.StateChangeReturn.FAILURE:
@@ -616,7 +611,6 @@ class HailoTrackerPipeline:
         if self.enable_rtsp: print("RTSP Stream: rtsp://localhost:8554/hailo_stream")
         if self.enable_websocket: print("WebSocket: ws://localhost:8765")
         if self.enable_mqtt: print(f"MQTT Topic: {self.mqtt_publisher.topic}")
-        if self.enable_webrtc: print("WebRTC: Requires signaling server")
         if self.enable_recording: print(f"Recording to: {self.output_video_path}")
         print("="*60)
         print("\n⌨Press Ctrl+C to stop\n")
@@ -626,12 +620,18 @@ class HailoTrackerPipeline:
             self.loop.run()
         except KeyboardInterrupt:
             print("\n\n[Pipeline] Interrupted by user")
+        except Exception as e:
+            print(f"\n[ERROR] Unexpected error: {e}")
+        finally:
+            # Always call stop() to save statistics and cleanup
+            if not self.video_file:
+                self.stop()
         return True
     
     def stop(self):
         """
         Stops the pipeline and cleans up resources
-        """
+        """ 
         print("Stopping pipeline...")
         # Stop the pipeline
         if self.pipeline:
@@ -645,6 +645,7 @@ class HailoTrackerPipeline:
                 5 * Gst.SECOND,
                 Gst.MessageType.EOS | Gst.MessageType.ERROR
             )
+            # Check message type
             if msg:
                 if msg.type == Gst.MessageType.EOS:
                     print("[INFO] EOS received, file finalized properly")
@@ -656,26 +657,35 @@ class HailoTrackerPipeline:
             # Now set to NULL state
             self.pipeline.set_state(Gst.State.NULL)
         # Print statistics if in video mode
-            if self.statistics:
-                summary = self.statistics.print_summary()    
-                # Save statistics to JSON file
-                if self.output_video_path:
-                    stats_file = self.output_video_path.rsplit('.', 1)[0] + '_statistics.json'
-                    with open(stats_file, 'w') as f:
-                        json.dump(summary, f, indent=2)
-                    print(f"Statistics saved to: {stats_file}")
-        # disconnect form mgtt
+        if self.statistics:
+            self.statistics.end_time = datetime.now()
+            summary = self.statistics.print_summary()    
+            stats_file = self.output_video_path.rsplit('.', 1)[0]
+            # Save statistics to JSON file
+            if not self.video_file:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                stats_file += f"_statistics_{timestamp}.json"            
+            else:
+                stats_file += "_statistics.json"
+            try:
+                with open(stats_file, 'w') as f:
+                    json.dump(summary, f, indent=2)
+                print(f"Statistics saved to: {stats_file}")
+            except Exception as e:
+                print(f"[ERROR] Failed to save statistics: {e}")
+        # disconnect from MQTT
         if self.mqtt_publisher:
             self.mqtt_publisher.disconnect()
+        # Stop WebSocket server
+        if self.websocket_server:
+            self.websocket_server.stop()
         # Quit the main loop
         if self.loop:
             self.loop.quit()
+        # Set running flag to False
+        self.running = False
         print("Pipeline stopped")
     
-    def get_statistics(self):
-        """Returns statistics object for programmatic access"""
-        return self.statistics
-
 def main():
     """
     Main entry point for the application
@@ -683,10 +693,10 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Hailo Detection Pipeline')
     parser.add_argument('--rpicamera', action='store_true', help='Use RPi camera stream (IP camera 192.168.37.99 stream default)')
+    parser.add_argument('--rtsp-link', type=str, help='Use specific link to IP camera stream etc.: admin:password@192.168.37.99/Stream (if not set, uses default rtsp camera)')
     parser.add_argument('--video-file', type=str, help='Enter path to video file for analysis (if not set, uses camera or RTSP)')
     parser.add_argument('--enable-rtsp', action='store_true', help='Enable RTSP streaming (default False)')
     parser.add_argument('--enable-websocket', action='store_true', help='Enable WebSocket (default False)')
-    parser.add_argument('--enable-webrtc', action='store_true', help='Enable WebRTC (default False)')
     parser.add_argument('--enable-mqtt', action='store_true', help='Enable MQTT (default False)')
     parser.add_argument('--enable-recording', action='store_true', help='Enable recording output video (default False)')
     parser.add_argument('--output-path', type=str, help='Output video file path if recording is enabled')
@@ -696,6 +706,7 @@ def main():
     print("=" * 60)
     print("Hailo Tracker Pipeline - Raspberry Pi AI HAT+ (26 TOPS)")
     print("=" * 60)
+    rtsp_link = args.rtsp_link
     # Determine source
     video_file = args.video_file
     use_camera = args.rpicamera
@@ -720,14 +731,14 @@ def main():
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = f"hailo_output_{timestamp}.mp4"
-    
+
     # Create and start the pipeline with all features enabled
     tracker = HailoTrackerPipeline(
         rpicamera=use_camera, 
+        rtsp_link=rtsp_link,
         video_file=video_file,
         enable_rtsp=args.enable_rtsp, 
-        enable_websocket=args.enable_websocket, 
-        enable_webrtc=args.enable_webrtc, 
+        enable_websocket=args.enable_websocket,  
         enable_mqtt=args.enable_mqtt,
         enable_recording=args.enable_recording,
         output_video_path=output_path,
@@ -748,71 +759,51 @@ CONFIGURATION NOTES:
    - URL: rtsp://YOUR_PI_IP:8554/hailo_stream
    - View with: ffplay rtsp://YOUR_PI_IP:8554/hailo_stream
    - Or VLC: vlc rtsp://YOUR_PI_IP:8554/hailo_stream
-s   - Encoded with H.264 for wide compatibility
-2. WebSocket Server:
+   - Encoded with H.264 for wide compatibility
+2. MQTT Publisher:
+    - Broker: mqtt.portabo.cz
+    - Port: 8883 (TLS)
+    - Topic: /videoanalyza
+    - Client ID: hailo_tracker_client
+    - Username: videoanalyza
+    - Publishes JSON data with detection results
+3. WebSocket Server for detections sending:
    - Default port: 8765
    - Sends JSON data with detection results
-   - Data format:
-     {
-       "timestamp": "2025-11-29T10:30:45.123",
-       "frame_count": 1234,
-       "detections": [
-         {
-           "class": "person",
-           "confidence": 0.95,
-           "bbox": {"x": 100, "y": 150, "width": 200, "height": 300},
-           "tracking_id": 42
-         }
-       ]
-     }
-3. WebSocket Client Example (JavaScript):
-   const ws = new WebSocket('ws://YOUR_PI_IP:8765');
-   ws.onmessage = (event) => {
-     const data = JSON.parse(event.data);
-     console.log('Detections:', data.detections);
-   };
-4. WebSocket Client Example (Python):
-   import asyncio
-   import websockets
-   async def receive_detections():
-       uri = "ws://YOUR_PI_IP:8765"
-       async with websockets.connect(uri) as websocket:
-           while True:
-               data = await websocket.recv()
-               print(f"Received: {data}")
-   asyncio.run(receive_detections())
-5. Model Files:
+   - Connect with WebSocket client
+4. Model Files:
    - Update hef-path and config-path with your actual file locations
    - Ensure Hailo runtime is properly installed
-6. Performance Optimization:
+   - post-process shared object path is set correctly
+5. Performance Optimization:
    - Adjust bitrate in x264enc (default: 2000 kbps)
    - Modify framerate if needed
    - Lower resolution for better performance
    - Adjust WebSocket update frequency (currently 10 Hz)
-7. Firewall Configuration:
+6. Firewall Configuration:
    - Open port 8554 for RTSP
    - Open port 8765 for WebSocket
    - Example: sudo ufw allow 8554/tcp
    - Example: sudo ufw allow 8765/tcp
-8. Dependencies:
+7. Dependencies:
    - GStreamer 1.0+ with Python bindings
    - GStreamer RTSP Server (python3-gst-1.0, gstreamer1.0-rtsp)
    - websockets library: pip install websockets
+   - paho-mqtt library: pip install paho-mqtt
    - Hailo GStreamer plugins
-   - rpicam-apps and rpicamsrc plugin
+   - rpicam-apps and rpicamsrc plugin or rstpsrc for RTSP input
 9. Multiple Outputs:
-   - Can enable/disable RTSP, WebSocket, and display independently
+   - Can enable/disable RTSP, video recording, WebSocket, MQTT and display independently
    - Useful for headless operation (disable_display=False)
    - Can run multiple instances with different ports
-INSTALLATION:
-=============
-sudo apt-get install gstreamer1.0-tools gstreamer1.0-rtsp
-sudo apt-get install python3-gi python3-gst-1.0
-pip3 install websockets
 USAGE:
 ======
-python3 hailo_tracker.py
+python3 DetectionWithGStreamer_pipeline.py
 Then connect to:
 - RTSP: rtsp://raspberry-pi-ip:8554/hailo_stream
+- MQTT: mqtt.portabo.cz topic /videoanalyza
 - WebSocket: ws://raspberry-pi-ip:8765
+
+RUN IN BACKGROUND:
+nohup python3 AI_traffic_detection_hailo/DetectionWithGStreamer_pipeline.py --enable-mqtt > detection.log 2>&1 &
 """

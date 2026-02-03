@@ -72,7 +72,7 @@ class MQTTPublisher:
             self.client.connect(self.broker_host, self.broker_port, keepalive=60)
             self.client.loop_start()
             # Wait for connection
-            timeout = 10
+            timeout = 60
             start = time.time()
             while not self.connected and (time.time() - start) < timeout:
                 time.sleep(0.1)

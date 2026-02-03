@@ -180,39 +180,6 @@ class PostgreDatabaseManager:
         print(f"[DatabaseManager] Parsed {len(payload['detections'])} detections from MQTT message")
         return detections
     
-    
-    # DATABASE OPERATIONS
-    def insert_detection(self, detection_data: Dict[str, Any]):
-        """
-        Insert single detection.
-        Args:
-            detection_data: Dictionary with keys:
-                - timestamp_ (datetime)
-                - frame_id (int)
-                - class_name (str)
-                - confidence (float)
-                - x1, y1, x2, y2 (int)
-                - track_id (int, optional)
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        #print("[DatabaseManager] Inserting single detection...")
-        try:
-            cursor.execute('''
-                INSERT INTO detections (timestamp_, frame_id, class_name, confidence, x1, y1, x2, y2, track_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ''', (
-                detection_data.get('timestamp_'), detection_data.get('frame_id'), detection_data.get('class_name'), detection_data.get('confidence'),
-                detection_data.get('x1'), detection_data.get('y1'), detection_data.get('x2'), detection_data.get('y2'), detection_data.get('track_id')
-            ))
-            conn.commit()
-        except Exception as e:
-            print(f"[DatabaseManager] Error inserting detection: {e}")
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-            self.return_connection(conn)
-    
     def insert_batch_detections(self, detections: List[Dict[str, Any]]):
         """
         Insert multiple detections in batch (much faster than individual inserts).
@@ -269,7 +236,7 @@ class PostgreDatabaseManager:
             cursor.execute('''
                 SELECT id, timestamp_, frame_id, class_name, confidence, x1, y1, x2, y2, track_id
                 FROM detections
-                WHERE timestamp_ > NOW() - INTERVAL '%s minutes'
+                WHERE timestamp_ > NOW() - make_interval(mins => %s)
                 ORDER BY timestamp_ DESC
                 LIMIT %s
             ''', (minutes, limit))
@@ -278,7 +245,48 @@ class PostgreDatabaseManager:
         finally:
             cursor.close()
             self.return_connection(conn)
-    
+
+    def get_counts_detections(self, minutes: int = 5, per: str = "10 minutes") -> List[Dict[str, Any]]:
+        """
+        Get counts of detections within a time interval.
+        Args:
+            minutes: Time interval in minutes
+            per: Time unit for grouping (e.g., "minute", "hour")
+        Returns:
+            Dictionary with counts
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        if per == "1 minute":
+            time_bucket = "date_trunc('minute', timestamp_)"
+        elif per == "10 minutes":
+            time_bucket = """
+                date_trunc('minute', timestamp_)
+                - INTERVAL '1 minute' * (EXTRACT(MINUTE FROM timestamp_)::int % 10)
+            """
+        elif per == "1 hour":
+            time_bucket = "date_trunc('hour', timestamp_)"
+        elif per == "1 day":
+            time_bucket = "date_trunc('day', timestamp_)"
+        else:
+            raise ValueError("Unsupported interval")
+        try:
+            query = f"""
+                SELECT
+                    {time_bucket} AS time_bucket,
+                    COUNT(*) AS detection_count
+                FROM detections
+                WHERE timestamp_ > NOW() - INTERVAL %s
+                GROUP BY time_bucket
+                ORDER BY time_bucket
+            """
+            cursor.execute(query, (f"{minutes} minutes"))
+            results = cursor.fetchall()
+            return [dict(row) for row in results]
+        finally:
+            cursor.close()
+            self.return_connection(conn)
+
     def get_statistics(self, hours: int = 1) -> Dict[str, Dict[str, Any]]:
         """
         Get aggregated statistics by class.
@@ -407,8 +415,7 @@ def test_database_manager():
             db.close()
             mqtt_client.disconnect()
 
-if __name__ == "__main__":
-    #test_database_manager()
+def main():
     # Test configuration
     config = { 'host': '192.168.37.31', 'port': 5432, 'database': 'hailo_db', 'user': 'hailo_user', 'password': 'hailo_pass', 'min_connections': 2, 'max_connections': 10 }
     try:
@@ -439,6 +446,7 @@ if __name__ == "__main__":
                 # Also print database health
                 health = db.get_health_status()
                 print(f"Database: {health['total_detections']} total detections, " f"Size: {health['database_size']}")
+                #print("Counts: ", db.get_counts_detections(minutes=560, per="1 hour"))
                 last_stats_time = time.time()
     except KeyboardInterrupt:
         print("\n\nShutting down...")
@@ -451,3 +459,7 @@ if __name__ == "__main__":
             mqtt_client.disconnect()
         print("✓ Shutdown complete")
     
+
+if __name__ == "__main__":
+    #test_database_manager()
+    main()
