@@ -813,26 +813,26 @@ def run_streamlit():
                     else:
                         st.error(f"Failed: {result}")
         
-        st.subheader("Time Range")
-        time_range = st.selectbox(
-            "Select time range",
-            options=[5, 15, 30, 60, 180, 360, 720, 1440, 2880, 5760, 10080, 20160],
-            format_func=lambda x: f"Last {x} minutes" if x < 60 else f"Last {x//60} hours",
-            index=3
-        )
-        st.subheader("Statistics interval")
+        time_format_func = lambda x: f"Last {x} minutes" if x < 60 else (f"Last {x//1440} days" if x > 1440 else f"Last {x//60} hours")
+        st.subheader("Statistics table interval")
         stats_hours = st.selectbox(
             "Statistics win",
             options=[1, 6, 12, 24, 48, 168],
             format_func=lambda x: f"Last {x} hours" if x < 24 else f"Last {x//24} days",
             index=3
         ) 
-
-        INTERVAL_MAP = {"1 minute": "1T", "10 minutes": "10T", "1 hour": "1H", "1 day": "1D", "1 month": "M1" }
+        st.subheader("Time Range")
+        time_range = st.selectbox(
+            "Select time range",
+            options=[60, 180, 360, 720, 1440, 2880, 5760, 10080, 20160, 40320],
+            format_func=time_format_func,
+            index=1
+        )
+        INTERVAL_MAP = {"1 minute": "1T", "10 minutes": "10T", "30 minutes": "30T", "1 hour": "1H", "1 day": "1D", "1 month": "M1" }
         DTICK_MAP = {"1T": 1 * 60 * 1000,"10T": 10 * 60 * 1000,"30T": 30 * 60 * 1000,"1H": 60 * 60 * 1000,"6H": 6 * 60 * 60 * 1000,"1D": 24 * 60 * 60 * 1000,"1W": 7 * 24 * 60 * 60 * 1000,"1M": "M1","3M": "M3","1Y": "M12"}
         FORMAT_MAP = {"1T": "%H:%M", "10T": "%H:%M", "30T": "%H:%M", "1H": "%H:%M", "6H": "%H:%M", "1D": "%d.%m", "1W": "%d.%m", "M1": "%b %Y", "M3": "%b %Y", "M12": "%Y"}
         st.subheader("Time counts visualisation format")
-        per = st.selectbox("Time aggregation", options=["1 minute", "10 minutes", "1 hour", "1 day", "1 month"], index=1)
+        per = st.selectbox("Time aggregation", options=["1 minute", "10 minutes", "30 minutes", "1 hour", "1 day", "1 month"], index=1)
         
         st.markdown("---")
         auto_refresh = st.checkbox("Enable auto-refresh", value=True)
@@ -868,14 +868,73 @@ def run_streamlit():
         if df_detections.empty:
             st.warning("No detection data available for the selected time range.")
         else:
-            st.subheader(f"Detection Analytics Dashboard last {time_range} minutes")
-            # Key metrics
+            st.subheader(f"Detection Analytics Dashboard {time_format_func(time_range).lower()}.")
+            # Key metrics0
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Total Detections", f"{len(df_detections):,}")
             with col2:
                 st.metric("Avg Confidence", f"{df_detections['confidence'].mean():.2%}")
-            st.markdown("---")
+            
+            # histogram
+            col1 = st.columns(1)[0]
+            with col1:
+                df_timeline = df_detections.copy()
+                selected = INTERVAL_MAP[per]
+                df_timeline = df_timeline.set_index("timestamp")
+                # Group by both time and class
+                df_class_timeline = (
+                    df_timeline.groupby('class_name')
+                    .resample(selected)
+                    .size()
+                    .reset_index(name="count")
+                )
+                # Remove incomplete periods at start and end
+                if len(df_class_timeline) > 0:
+                    # Get second and second-to-last timestamps
+                    unique_times = sorted(df_class_timeline['timestamp'].unique())
+                    if len(unique_times) > 2:
+                        df_class_timeline = df_class_timeline[(df_class_timeline['timestamp'] > unique_times[0]) & (df_class_timeline['timestamp'] < unique_times[-1])]
+                # Sort classes by total count (descending)
+                class_order = (
+                    df_class_timeline.groupby('class_name')['count']
+                    .sum()
+                    .sort_values(ascending=True)  # Největší první
+                    .index.tolist()
+                )
+                # Convert class_name to categorical with specified order
+                df_class_timeline['class_name'] = pd.Categorical(
+                    df_class_timeline['class_name'],
+                    categories=class_order,
+                    ordered=True
+                )
+                # Create stacked bar chart
+                fig_timeline = px.bar(
+                    df_class_timeline,
+                    x="timestamp",
+                    y="count",
+                    color="class_name",  # Different color per class
+                    title=f"Diagram by detections every {per}",
+                    labels={'count': 'Number of Objects', 'timestamp': 'Time', 'class_name': 'Class'},
+                    barmode='stack',  # Options: 'stack', 'group', 'overlay'
+                    category_orders={'class_name': class_order}
+                )
+                columns_count = len(sorted(df_class_timeline['timestamp'].unique()))
+                fig_timeline.update_xaxes(
+                    type="date",
+                    title="Time",
+                    nticks=DTICK_MAP[selected] if columns_count < 60 else 15,
+                    tickformat=FORMAT_MAP[selected], 
+                    ticklabelmode="period",
+                    ticks="outside",
+                    tickangle= -45 if columns_count > 20 else 0
+                )
+                fig_timeline.update_layout(
+                    height=800,
+                    hovermode="x unified", 
+                    yaxis_title="Number of Objects"
+                )
+                st.plotly_chart(fig_timeline, use_container_width=True)
 
             # Detection timeline line chart
             col1 = st.columns(1)[0]
@@ -944,11 +1003,12 @@ def run_streamlit():
                     labels={'class_name': 'Class', 'confidence': 'Confidence'}
                 )
                 fig_conf.update_layout(
-                    height=600, 
+                    height=800, 
                     showlegend=False
                 )
                 st.plotly_chart(fig_conf, width='stretch')
             st.markdown("---")
+
             col1 = st.columns(1)[0]
             with col1:
                 # Calculate bbox centers
@@ -968,7 +1028,7 @@ def run_streamlit():
                 fig_scatter.update_yaxes(autorange="reversed")
                 fig_scatter.update_layout(title='Spatial analysis map',height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
-
+            
             # Bounding box confidence per class visualization
             col1 = st.columns(1)[0]
             with col1:
