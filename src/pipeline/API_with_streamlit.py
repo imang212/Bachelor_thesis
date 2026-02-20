@@ -812,7 +812,8 @@ def run_streamlit():
                         st.rerun()
                     else:
                         st.error(f"Failed: {result}")
-        
+            
+
         time_format_func = lambda x: f"Last {x} minutes" if x < 60 else (f"Last {x//1440} days" if x > 1440 else f"Last {x//60} hours")
         st.subheader("Statistics table interval")
         stats_hours = st.selectbox(

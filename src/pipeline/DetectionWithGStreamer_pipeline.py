@@ -23,15 +23,15 @@ import json
 import threading
 import sys
 from datetime import datetime
+from collections import deque
 from collections import defaultdict
 from MQTTClient import MQTTPublisher
 from WebSocket import WebSocketServerWithDetectionData
-import numpy as np
 try:
     from hailo import get_roi_from_buffer, HAILO_DETECTION, HAILO_UNIQUE_ID
 except ImportError as e:
     print(f"Error message: {e}") # The error message tells you exactly which .so version it's looking for
-
+from shapely.geometry import Point, Polygon
 # Initialize GStreamer
 Gst.init(None)
 Gst.version()
@@ -319,11 +319,17 @@ class HailoTrackerPipeline:
         # frame count
         self.frame_count = 0
         # Set of sent track IDs to avoid duplicates
+        self._sent_deque = deque(maxlen=50)
         self.sent_track_ids = set()
+        # valid labels
+        self.VALID_LABELS = frozenset(["car", "motorcycle", "bicycle", "truck", "bus", "person"])
         # Recording
         self.recording_sink = None
         # Dynamic overlay text for count display
-        self.count_overlay = ""  
+        self.count_overlay = ""
+        # Detection zone
+        self.zone_points = [(0.1, 0.85), (0.46, 0.85), (0.6, 0.9), (0.45, 0.9), (0.4, 1)]
+        self.zone_polygon = Polygon(self.zone_points)   
         # Running flag
         self.running = False
         
@@ -349,6 +355,8 @@ class HailoTrackerPipeline:
                 "! decodebin "
                 "! videoconvert "
                 "! videoscale "
+                "! video/x-raw,width=1280,height=720,format=RGB " 
+                "! videocrop top=80 left=200 right=440 bottom=0 "
             )
         elif self.rpicamera:
             pipeline_str = (
@@ -372,15 +380,19 @@ class HailoTrackerPipeline:
         pipeline_str += (
             "! videoscale method=lanczos "
             "! video/x-raw,width=640,height=640,format=RGB "
-            "! hailonet hef-path=/home/imang/tappas/apps/detection/resources/h8/yolov8m.hef batch-size=1 "
+            "! hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef batch-size=1 "#"! hailonet hef-path=/home/imang/tappas/apps/detection/resources/h8/yolov8m.hef batch-size=1 "
             "nms-score-threshold=0.6 nms-iou-threshold=0.5 name=hailonet "
             "! queue leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # allow some leakiness before hailofilter
             "! hailofilter qos=false name=hailofilter function-name=yolov8m "
             "so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so "
             "! queue leaky=no max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # After hailofilter, keep tight 
-            "! hailotracker keep-past-metadata=true kalman-dist-thr=0.85 iou-thr=0.5 keep-new-frames=5 keep-tracked-frames=45 keep-lost-frames=20 name=hailotracker "
+            "! hailotracker keep-past-metadata=true kalman-dist-thr=0.95 iou-thr=0.5 keep-new-frames=5 keep-tracked-frames=45 keep-lost-frames=50 name=hailotracker "
             "! hailooverlay show-confidence=true line-thickness=2 name=hailooverlay "
-            "! textoverlay text='Hailo Tracker - YOLOv8m' valignment=top halignment=left font-desc='Sans 12' "
+            "! videoconvert "
+            "! video/x-raw, format=BGRx " 
+            "! cairooverlay name=zone_overlay "
+            "! videoconvert "
+            "! textoverlay text='Hailo Tracker - yolov8m' valignment=top halignment=left font-desc='Sans 12' "
             "! textoverlay text='Counting...' valignment=bottom halignment=left font-desc='Sans Bold 14' name=count_overlay "
             "! videoconvert "
             "! video/x-raw,format=I420 "
@@ -434,8 +446,11 @@ class HailoTrackerPipeline:
         except Exception as e:
             print(f"[ERROR] Failed to create pipeline: {e}")
             return
-         # Get the count overlay element
+        # Get the count overlay element
         self.count_overlay = self.pipeline.get_by_name('count_overlay')
+        zone_overlay = self.pipeline.get_by_name('zone_overlay')
+        if zone_overlay:
+            zone_overlay.connect("draw", self.on_draw_polygon)
         # Set up buffer probe on hailofilter to extract detection metadata
         hailotracker = self.pipeline.get_by_name('hailotracker') # Get the hailofilter element to extract detection data
         if hailotracker:
@@ -451,6 +466,27 @@ class HailoTrackerPipeline:
         # Set running flag to True
         self.running = True
 
+    def on_draw_polygon(self, overlay, context, timestamp, duration):
+        width, height = 640, 640 
+        context.set_source_rgba(0, 1, 0, 0.1) # Transparent Green
+        context.move_to(self.zone_points[0][0] * width, self.zone_points[0][1] * height)
+        for x, y in self.zone_points[1:]:
+            context.line_to(x * width, y * height)
+        context.close_path()
+        context.fill_preserve()
+        context.set_source_rgb(0, 1, 0) # Solid Green Border
+        context.set_line_width(1)
+        context.stroke()
+
+    def _mark_sent(self, track_id):
+        """Adds track_id; auto-evicts oldest when deque is full."""
+        # When deque reaches maxlen, the next append auto-evicts the oldest item
+        if len(self._sent_deque) == self._sent_deque.maxlen:
+            oldest_id = self._sent_deque.popleft() # Manually evict from set
+            self.sent_track_ids.discard(oldest_id)    
+        self._sent_deque.append(track_id)
+        self.sent_track_ids.add(track_id)
+    
     def buffer_probe_callback(self, pad, info):
         """
         Callback function to extract detection and tracker metadata from GStreamer buffers
@@ -486,14 +522,19 @@ class HailoTrackerPipeline:
             cx = (bbox.xmin() + bbox.width() * 0.5)
             cy = (bbox.ymin() + bbox.height() * 0.5) 
             # filter zone
-            in_zone = (0.15 <= cx <= 0.5 and 0.85 <= cy <= 0.99)
-            if not in_zone:
-                #print(f"y={cy} not in zone")
+            #in_zone = (0.15 <= cx <= 0.5 and 0.85 <= cy <= 0.99)
+            #if not in_zone:
+            #    #print(f"y={cy} not in zone")
+            #    continue
+            # Create a point object for the object's center
+            detection_point = Point(cx, cy)
+            # Check if the point is inside your polygon
+            if not self.zone_polygon.contains(detection_point):
                 continue
             # Get tracking ID if available
             tracking_id = None
             track = detection.get_objects_typed(HAILO_UNIQUE_ID)
-            if len(track) == 1: tracking_id = track[0].get_id()
+            tracking_id = track[0].get_id() if track else None
             # Filter by class (only vehicles and persons)
             if label not in ["car", "motorcycle", "bicycle", "truck", "bus", "person"]:  # Threshold for valid detections
                 #print(f"[DEBUG] Skipping detection with label(not vehicle): {label}")
@@ -517,7 +558,7 @@ class HailoTrackerPipeline:
             if detection_list and self.enable_mqtt and self.mqtt_publisher and self.mqtt_publisher.connected:
                 data_dict = self.detection_data.get_dict()
                 self.mqtt_publisher.publish(data_dict)
-                self.sent_track_ids.add(tracking_id)  # ONLY after publish
+                self._mark_sent(tracking_id)  # ONLY after publish
             # Debug print
             if self.enable_debug:
                 print(f"Label: {label}, Confidence: {confidence:.2f}, BBox: {bbox_coords}, Track ID: {tracking_id}")
@@ -565,10 +606,7 @@ class HailoTrackerPipeline:
         except Exception as e:
             print(f"[ERROR] RTSP sample callback error: {e}")
             return Gst.FlowReturn.ERROR
-    
-    
-
-
+        
     def start(self):
         """
         Starts the pipeline with all configured features

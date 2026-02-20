@@ -46,9 +46,10 @@ Praktická část
 9.  Prezentace a interpretace výsledků
 
 ### Literatura:
-1. HAILO TECHNOLOGIES LTD. Automatic License Plate Recognition with Hailo Processors [online]. Hailo blog. 2024 [cit. 2025-12-04]. Dostupné z: https://hailo.ai/ja/blog/automatic-license-plate-recognition-with-hailo-processors/
-2. HYNDMAN, Rob J. a George ATHANASOPOULOS. Forecasting: principles and practice. Second edition. [Melbourne]: OTexts, 2018. ISBN 978-0-9875071-1-2.
-3. RASPBERRY PI FOUNDATION. AI Kit and AI HAT+ software [online]. [cit. 2025-12-04]. Dostupné z: https://www.raspberrypi.com/documentation/computers/ai.html
-4. REDMON, Joseph, Santosh DIVVALA, Ross GIRSHICK a Ali FARHADI. You Only Look Once: Unified, Real-Time Object Detection. ArXiv.org [online]. 2015, 2016-05-09, 10 [cit. 2025-11-03]. Dostupné z:  https://arxiv.org/abs/1506.02640
-5. SZELISKI, Richard. Computer vision: algorithms and applications. Second edition. Cham, Switzerland: Springer. ISBN 978-3-030-34372-9.
-6. ZHOU, Wei, Li YANG, Lei ZHAO, Runyu ZHANG a ostatní. Vision Technologies with Applications in Traffic Surveillance Systems: A Holistic Survey. ArXiv.org [online]. 2025-06-28, 2024, 25 [cit. 2025-12-04]. Dostupné z:  https://arxiv.org/abs/2412.00348
+
+1. EVERINGHAM, Mark, Luc VAN GOOL, Christopher K. I. WILLIAMS, John WINN a Andrew ZISSERMAN. The Pascal Visual Object Classes (VOC) Challenge. International Journal of Computer Vision [online]. Springer Science and Business Media, 2009, 2009-9-9, 88(2), 303-338 [cit. 2026-02-13]. ISSN 0920-5691. Dostupné z: doi:10.1007/s11263-009-0275-4
+2. LI, En, Liekang ZENG, Zhi ZHOU a Xu CHEN. Edge AI: On-Demand Accelerating Deep Neural Network Inference via Edge Computing. IEEE Transactions on Wireless Communications [online]. 2020, 19(1), s. 447-457 [cit. 2026-02-14]. Dostupné z: doi:10.1109/TWC.2019.2946140
+3. REDMON, Joseph, Santosh DIVVALA, Ross GIRSHICK a Ali FARHADI. You Only Look Once: Unified, Real-Time Object Detection. 2016 IEEE Conference on Computer Vision and Pattern Recognition (CVPR) [online]. IEEE, 2016, 779-788 [cit. 2026-02-13]. Dostupné z: doi:10.1109/cvpr.2016.91
+4. SZELISKI, Richard. Computer vision: algorithms and applications. Second edition. Cham, Switzerland: Springer, [2022]. Texts in computer science. ISBN 978-3-030-34372-9.
+5. WOJKE, Nicolai, Alex BEWLEY a Dietrich PAULUS. Simple online and realtime tracking with a deep association metric. 2017 IEEE International Conference on Image Processing (ICIP) [online]. IEEE, 2017, 2017, 3645-3649 [cit. 2026-02-13]. Dostupné z: doi:10.1109/icip.2017.8296962
+6. ZHOU, Wei, Li YANG, Lei ZHAO, Runyu ZHANG, Yifan CUI, Hongpu HUANG, Kun QIE a Chen WANG. Vision Technologies with Applications in Traffic Surveillance Systems: A Holistic Survey. ACM Computing Surveys [online]. Association for Computing Machinery (ACM), 2025, 2025-9-9, 58(3), 1-47 [cit. 2026-02-13]. ISSN 0360-0300. Dostupné z: doi:10.1145/3760525
