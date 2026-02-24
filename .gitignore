@@ -1,2 +1,4 @@
 .venv
 videos
+diagram_convert.py
+architecture.mmd
