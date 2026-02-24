@@ -1,0 +1,24 @@
+{
+  "total_frames": 4957,
+  "frames_with_detections": 3594,
+  "unique_objects_tracked": 127,
+  "processing_time": "168.65 seconds",
+  "fps": "29.39",
+  "detections_by_class": {
+    "car": {
+      "count": 4349,
+      "real_object_count": 120,
+      "average_confidence": "0.7787"
+    },
+    "bus": {
+      "count": 127,
+      "real_object_count": 4,
+      "average_confidence": "0.7400"
+    },
+    "truck": {
+      "count": 304,
+      "real_object_count": 3,
+      "average_confidence": "0.7057"
+    }
+  }
+}

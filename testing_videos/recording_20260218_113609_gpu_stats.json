@@ -1,0 +1,31 @@
+{
+  "total_frames": 2977,
+  "frames_with_detections": 2953,
+  "unique_objects_tracked": 132,
+  "processing_time": "206.38 seconds",
+  "fps": "14.42",
+  "detections_by_class": {
+    "car": {
+      "count": 5658,
+      "real_object_count": 108,
+      "average_confidence": "0.7582"
+    },
+    "bus": {
+      "count": 219,
+      "real_object_count": 11,
+      "average_confidence": "0.7544"
+    },
+    "truck": {
+      "count": 543,
+      "real_object_count": 12,
+      "average_confidence": "0.6817"
+    },
+    "person": {
+      "count": 23,
+      "real_object_count": 1,
+      "average_confidence": "0.5573"
+    }
+  },
+  "recording_start": "2026-02-18T11:36:09.003458",
+  "recording_end": "2026-02-18T11:39:35.383528"
+}
