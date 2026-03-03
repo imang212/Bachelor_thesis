@@ -812,17 +812,9 @@ def run_streamlit():
                         st.rerun()
                     else:
                         st.error(f"Failed: {result}")
-            
-
+        stats_format_func = lambda x: f"Last {x} hours" if x < 24 else (f"Last {x//24} days" if x > 24 else f"Last {x//24} days")    
         time_format_func = lambda x: f"Last {x} minutes" if x < 60 else (f"Last {x//1440} days" if x > 1440 else f"Last {x//60} hours")
-        st.subheader("Statistics table interval")
-        stats_hours = st.selectbox(
-            "Statistics win",
-            options=[1, 6, 12, 24, 48, 168],
-            format_func=lambda x: f"Last {x} hours" if x < 24 else f"Last {x//24} days",
-            index=3
-        ) 
-        st.subheader("Time Range")
+        st.subheader("Detections Time Range")
         time_range = st.selectbox(
             "Select time range",
             options=[60, 180, 360, 720, 1440, 2880, 5760, 10080, 20160, 40320],
@@ -832,9 +824,6 @@ def run_streamlit():
         INTERVAL_MAP = {"1 minute": "1T", "10 minutes": "10T", "30 minutes": "30T", "1 hour": "1H", "1 day": "1D", "1 month": "M1" }
         DTICK_MAP = {"1T": 1 * 60 * 1000,"10T": 10 * 60 * 1000,"30T": 30 * 60 * 1000,"1H": 60 * 60 * 1000,"6H": 6 * 60 * 60 * 1000,"1D": 24 * 60 * 60 * 1000,"1W": 7 * 24 * 60 * 60 * 1000,"1M": "M1","3M": "M3","1Y": "M12"}
         FORMAT_MAP = {"1T": "%H:%M", "10T": "%H:%M", "30T": "%H:%M", "1H": "%H:%M", "6H": "%H:%M", "1D": "%d.%m", "1W": "%d.%m", "M1": "%b %Y", "M3": "%b %Y", "M12": "%Y"}
-        st.subheader("Time counts visualisation format")
-        per = st.selectbox("Time aggregation", options=["1 minute", "10 minutes", "30 minutes", "1 hour", "1 day", "1 month"], index=1)
-        
         st.markdown("---")
         auto_refresh = st.checkbox("Enable auto-refresh", value=True)
         refresh_interval = st.slider("Refresh interval (seconds)", 5, 60, 60)
@@ -845,57 +834,111 @@ def run_streamlit():
     ## DASHBOARD
     if db_status and db_status.get('status') == "healthy": 
         df_detections = fetch_detections(minutes=time_range, limit=10000000)
-        stats = fetch_statistics(hours=stats_hours)
         # Statistics summary table
-        if stats:
-            st.subheader(f"Statistics Summary last {stats_hours} hours")    
-            col1 = st.columns(1)[0]
-            with col1:
-                if stats:
-                    stats_data = []
-                    for class_name, data in stats.items():
-                        stats_data.append({
-                            'Class': data['class_name'],
-                            'Total Detections': data['total_detections'],
-                            'Avg Confidence': f"{data['avg_confidence']:.2%}",
-                            'Min Confidence': f"{data['min_confidence']:.2%}",
-                            'Max Confidence': f"{data['max_confidence']:.2%}"
-                        })
-                    stats_df = pd.DataFrame(stats_data)
-                    st.dataframe(stats_df, width='stretch', hide_index=True)
-        else:
-            st.info("No statistics available for the selected time range.")
-
+        col1 = st.columns(1)[0]
+        with col1:
+            st.subheader(f"Statistics Summary")    
+            stats_hours = st.selectbox(
+                "**Statistics time range:**",
+                options=[1, 6, 12, 24, 48, 168, 336, 720, 1440, 2880, 5760, 10080, 20160, 40320],
+                format_func=stats_format_func,
+                index=3
+            ) 
+            stats = fetch_statistics(hours=stats_hours)
+            if stats:
+                stats_data = []
+                for class_name, data in stats.items():
+                    stats_data.append({
+                        'Class': data['class_name'],
+                        'Total Detections': data['total_detections'],
+                        'Avg Confidence': f"{data['avg_confidence']:.2%}",
+                        'Min Confidence': f"{data['min_confidence']:.2%}",
+                        'Max Confidence': f"{data['max_confidence']:.2%}"
+                    })
+                stats_df = pd.DataFrame(stats_data)
+                st.dataframe(stats_df, width='stretch', hide_index=True)
+            else:
+                st.info("No statistics available for the selected time range.")
         if df_detections.empty:
             st.warning("No detection data available for the selected time range.")
         else:
             st.subheader(f"Detection Analytics Dashboard {time_format_func(time_range).lower()}.")
-            # Key metrics0
+            # Key metrics
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Total Detections", f"{len(df_detections):,}")
             with col2:
                 st.metric("Avg Confidence", f"{df_detections['confidence'].mean():.2%}")
-            
             # histogram
             col1 = st.columns(1)[0]
             with col1:
-                df_timeline = df_detections.copy()
+                st.subheader("Histogram of Detected Classes")
+                per = st.pills(
+                    "**Time aggregation:**",
+                    options=["1 minute", "10 minutes", "30 minutes", "1 hour", "1 day", "1 month"],
+                    selection_mode="single",
+                    default="10 minutes",
+                    key="time_aggregation_pills"
+                )
+                per = per if per is not None else "10 minutes"
                 selected = INTERVAL_MAP[per]
-                df_timeline = df_timeline.set_index("timestamp")
-                # Group by both time and class
-                df_class_timeline = (
-                    df_timeline.groupby('class_name')
-                    .resample(selected)
-                    .size()
-                    .reset_index(name="count")
+                
+                available_classes = sorted(df_detections['class_name'].unique().tolist())
+                selected_classes = st.pills(
+                    "**Filter classes:**",
+                    options=available_classes,
+                    selection_mode="multi",
+                    default=available_classes,
+                    key="class_filter"
+                )
+                st.html("""
+                <style>
+                    [data-testid="stButtonGroup"] {
+                        margin-bottom: 0px !important;
+                        padding-bottom: 0px !important;
+                    }
+                    [data-testid="stBaseButton-pillsActive"] {
+                        background-color: #1a4a1a !important;
+                        color: #ffffff !important;
+                        border: 1px solid #2e7d32 !important;
+                        border-radius: 0px !important;
+                        font-size: 12px !important;
+                        height: 26px !important;
+                        padding: 2px 10px !important;
+                    }
+                    [data-testid="stBaseButton-pills"] {
+                        background-color: #3a3a3a !important;
+                        color: #aaaaaa !important;
+                        border: 1px solid #555 !important;
+                        border-radius: 0px !important;
+                        font-size: 12px !important;
+                        height: 26px !important;
+                        padding: 2px 10px !important;
+                    }
+                    [data-testid="stBaseButton-pillsActive"]:hover {
+                        background-color: #2e5a2e !important;
+                    }
+                    [data-testid="stBaseButton-pills"]:hover {
+                        background-color: #4a4a4a !important;
+                    }
+                </style>
+                """)
+                active_classes = tuple(sorted(selected_classes if selected_classes else available_classes))
+                df_timeline = df_detections[df_detections['class_name'].isin(active_classes)].copy()
+                df_timeline['timestamp'] = pd.to_datetime(df_timeline['timestamp'], utc=True).dt.tz_localize(None)
+                df_timeline['timestamp'] = df_timeline['timestamp'].dt.tz_convert('UTC').dt.tz_localize(None)
+                df_grouped = (df_timeline.groupby('class_name').resample(selected).size().reset_index(name="count"))
+                df_pivot = df_grouped.pivot_table(index='timestamp', columns='class_name', values='count', fill_value=0).reset_index()
+                df_class_timeline = df_pivot.melt(
+                    id_vars='timestamp',
+                    var_name='class_name',
+                    value_name='count'
                 )
                 # Remove incomplete periods at start and end
-                if len(df_class_timeline) > 0:
-                    # Get second and second-to-last timestamps
-                    unique_times = sorted(df_class_timeline['timestamp'].unique())
-                    if len(unique_times) > 2:
-                        df_class_timeline = df_class_timeline[(df_class_timeline['timestamp'] > unique_times[0]) & (df_class_timeline['timestamp'] < unique_times[-1])]
+                unique_times = sorted(df_class_timeline['timestamp'].unique())
+                # Fix missing data for classes that don't appear in some time buckets
+                if len(df_class_timeline) > 0 and len(unique_times) > 2:
+                    df_class_timeline = df_class_timeline[(df_class_timeline['timestamp'] > unique_times[0]) & (df_class_timeline['timestamp'] < unique_times[-1])]
                 # Sort classes by total count (descending)
                 class_order = (
                     df_class_timeline.groupby('class_name')['count']
@@ -904,39 +947,48 @@ def run_streamlit():
                     .index.tolist()
                 )
                 # Convert class_name to categorical with specified order
-                df_class_timeline['class_name'] = pd.Categorical(
-                    df_class_timeline['class_name'],
-                    categories=class_order,
-                    ordered=True
-                )
-                # Create stacked bar chart
-                fig_timeline = px.bar(
-                    df_class_timeline,
-                    x="timestamp",
-                    y="count",
-                    color="class_name",  # Different color per class
-                    title=f"Diagram by detections every {per}",
-                    labels={'count': 'Number of Objects', 'timestamp': 'Time', 'class_name': 'Class'},
-                    barmode='stack',  # Options: 'stack', 'group', 'overlay'
-                    category_orders={'class_name': class_order}
-                )
-                columns_count = len(sorted(df_class_timeline['timestamp'].unique()))
-                fig_timeline.update_xaxes(
-                    type="date",
-                    title="Time",
-                    nticks=DTICK_MAP[selected] if columns_count < 60 else 15,
-                    tickformat=FORMAT_MAP[selected], 
-                    ticklabelmode="period",
-                    ticks="outside",
-                    tickangle= -45 if columns_count > 20 else 0
-                )
-                fig_timeline.update_layout(
-                    height=800,
-                    hovermode="x unified", 
-                    yaxis_title="Number of Objects"
-                )
-                st.plotly_chart(fig_timeline, use_container_width=True)
-
+                df_class_timeline['class_name'] = pd.Categorical(df_class_timeline['class_name'], categories=class_order, ordered=True)
+                unique_times = sorted(df_class_timeline['timestamp'].unique())
+                columns_count = max(len(unique_times), 1)
+                st.write(f"columns_count: {columns_count}")
+                st.write(f"selected interval: {selected}")
+                st.write(f"active_classes: {active_classes}")
+                st.write(f"unique timestamps: {len(unique_times)}")
+                st.write(f"df shape: {df_class_timeline.shape}")
+                st.write(df_class_timeline.head(10))
+                st.write(f"DTICK_MAP value: {DTICK_MAP[selected]}")
+                st.write(f"FORMAT_MAP value: {FORMAT_MAP[selected]}")
+                if columns_count >= 5:
+                    # Create stacked bar chart
+                    fig_timeline = px.bar(
+                        df_class_timeline,
+                        x="timestamp",
+                        y="count",
+                        color="class_name",  # Different color per class
+                        title=f"Diagram by detections every {per}",
+                        labels={'count': 'Number of Objects', 'timestamp': 'Time', 'class_name': 'Class'},
+                        barmode='stack',  # Options: 'stack', 'group', 'overlay'
+                        category_orders={'class_name': class_order}
+                    )
+                    fig_timeline.update_xaxes(
+                        type="date",
+                        title="Time",
+                        nticks=DTICK_MAP[selected] if columns_count < 60 else 15,
+                        tickformat=FORMAT_MAP[selected], 
+                        ticklabelmode="instant",
+                        tickson="boundaries",
+                        ticks="outside",
+                        tickangle= -45 if columns_count > 20 else 0
+                    )
+                    fig_timeline.update_layout(
+                        height=800,
+                        hovermode="x unified", 
+                        yaxis_title="Number of Objects"
+                    )
+                    st.plotly_chart(fig_timeline, use_container_width=True)
+                else:
+                    st.info("A little data available for the selected time range.")
+                    
             # Detection timeline line chart
             col1 = st.columns(1)[0]
             with col1:

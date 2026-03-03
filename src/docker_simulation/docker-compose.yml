@@ -1,0 +1,57 @@
+version: "3.9"
+volumes:
+  postgres_data:
+services:
+  postgres:
+    image: postgres:15
+    container_name: hailo_db
+    environment:
+      POSTGRES_USER: hailo_user
+      POSTGRES_PASSWORD: hailo_pass
+      POSTGRES_DB: hailo_db
+    volumes:
+      - ./postgres/init_hailo.sql:/docker-entrypoint-initdb.d/init_hailo.sql
+    ports:
+      - "5432:5432"
+  camera_sim:
+    image: aler9/rtsp-simple-server
+    container_name: camera_simulator
+    ports:
+      - "8554:8554"
+    volumes:
+      - ./camera_simulator/sample_video.mp4:/video.mp4
+    # Simple command to loop a video as an RTSP stream
+    entrypoint: 
+      - /bin/sh
+      - -c 
+      - "ffmpeg -re -stream_loop -1 -i /video.mp4 -c copy -f rtsp rtsp://localhost:8554/mystream"
+  ai_pipeline:
+    # Point to the root directory where your .py files are
+    build: 
+      context: .. 
+      dockerfile: docker-simulation/ai_pipeline/Dockerfile
+    container_name: detection_pipeline
+    devices:
+      - "/dev/hailo0:/dev/hailo0"
+    environment:
+      - RTSP_URL=rtsp://camera_sim:8554/mystream
+    # Use the filenames exactly as they appear in your repo
+    command: python3 DetectionWithGStreamer_pipeline.py --enable-mqtt --rtsp-link camera_sim:8554/mystream
+  api:
+    build: ./api
+    container_name: hailo_api
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_HOST=postgres
+    command: uvicorn API_with_streamlit:app --host 0.0.0.0 --port 8000
+  dashboard:
+    build: ./api
+    container_name: hailo_dashboard
+    depends_on:
+      - api
+    ports:
+      - "8501:8501"
+    command: streamlit run API_with_streamlit.py --server.port 8501 --server.address 0.0.0.0

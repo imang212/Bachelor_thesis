@@ -288,7 +288,7 @@ class HailoTrackerPipeline:
     """
     def __init__(self, rpicamera=False, rtsp_link=None, video_file=None, enable_rtsp=False, 
                  enable_websocket=False, enable_mqtt=False, enable_recording=False, 
-                 output_video_path=None, enable_debug=False):
+                 output_video_path=None, enable_debug=False, model_name=None):
         self.pipeline = None
         self.loop = None
         self.rpicamera = rpicamera
@@ -300,6 +300,7 @@ class HailoTrackerPipeline:
         self.enable_recording = enable_recording
         self.output_video_path = output_video_path
         self.enable_debug = enable_debug
+        self.model_name = model_name
         self.bus = None
         # Video analysis mode
         self.video_mode = output_video_path is not None
@@ -339,7 +340,7 @@ class HailoTrackerPipeline:
         1. libcamerasrc, rstpsrc - Captures video from raspberry IMX camera or RTSP source
         2. capsfilter - Sets video format and resolution
         3. videoconvert - Converts color format if needed
-        4. hailonet - Runs YOLOv8m detection on Hailo accelerator
+        4. hailonet - Runs YOLOv8s detection on Hailo accelerator
         5. hailofilter - Post-processes detection results
         6. hailotracker - Tracks detected objects across frames
         7. hailooverlay - Draws bounding boxes and tracking IDs
@@ -377,13 +378,17 @@ class HailoTrackerPipeline:
                 "! video/x-raw,width=1280,height=720,format=RGB " 
                 "! videocrop top=80 left=200 right=440 bottom=0 "  # Crop to bottom-left 640x640, top=440 left=320 right=960 bottom=0 for fullhd
             )
+        if self.model_name == "default_model":
+            hef_path = "/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef"
+        else:
+            hef_path = f"/home/imang/AI_traffic_detection_hailo/{self.model_name}.hef"
         pipeline_str += (
-            "! videoscale method=lanczos "
+            "! videoscale "
             "! video/x-raw,width=640,height=640,format=RGB "
-            "! hailonet hef-path=/home/imang/hailo-rpi5-examples/resources/models/hailo8/yolov8m.hef batch-size=1 "#"! hailonet hef-path=/home/imang/tappas/apps/detection/resources/h8/yolov8m.hef batch-size=1 "
+            f"! hailonet hef-path={hef_path} batch-size=1 "  
             "nms-score-threshold=0.6 nms-iou-threshold=0.5 name=hailonet "
             "! queue leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # allow some leakiness before hailofilter
-            "! hailofilter qos=false name=hailofilter function-name=yolov8m "
+            f"! hailofilter qos=false name=hailofilter function-name={'yolov8m' if self.model_name == 'default_model' else self.model_name} "
             "so-path=/usr/lib/aarch64-linux-gnu/hailo/tappas/post_processes/libyolo_hailortpp_post.so "
             "! queue leaky=no max-size-buffers=5 max-size-bytes=0 max-size-time=0 " # After hailofilter, keep tight 
             "! hailotracker keep-past-metadata=true kalman-dist-thr=0.95 iou-thr=0.5 keep-new-frames=5 keep-tracked-frames=45 keep-lost-frames=50 name=hailotracker "
@@ -392,7 +397,7 @@ class HailoTrackerPipeline:
             "! video/x-raw, format=BGRx " 
             "! cairooverlay name=zone_overlay "
             "! videoconvert "
-            "! textoverlay text='Hailo Tracker - yolov8m' valignment=top halignment=left font-desc='Sans 12' "
+            f"! textoverlay text='Hailo Tracker - {'yolov8m' if self.model_name == 'default_model' else self.model_name}' valignment=top halignment=left font-desc='Sans 12' "
             "! textoverlay text='Counting...' valignment=bottom halignment=left font-desc='Sans Bold 14' name=count_overlay "
             "! videoconvert "
             "! video/x-raw,format=I420 "
@@ -738,6 +743,7 @@ def main():
     parser.add_argument('--enable-mqtt', action='store_true', help='Enable MQTT (default False)')
     parser.add_argument('--enable-recording', action='store_true', help='Enable recording output video (default False)')
     parser.add_argument('--output-path', type=str, help='Output video file path if recording is enabled')
+    parser.add_argument('--model', type=str, default='default_model', help='Import model by name from main folder(default yolov8m from hailo rpi examples repository hef folder)')
     parser.add_argument('--debug', action='store_true', help='Enable debug output (default False)')
 
     args = parser.parse_args()
@@ -755,7 +761,7 @@ def main():
         print("Camera: IMX708")
     else:
         print("Source: RTSP Stream")
-    print("Model: YOLOv8m")
+    print(f"Model: {args.model}")
     print("Accelerator: Hailo 26 TOPS")
     print("=" * 60)
     print(f"GStreamer version: {Gst.version_string()}")
@@ -769,7 +775,7 @@ def main():
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = f"hailo_output_{timestamp}.mp4"
-
+    
     # Create and start the pipeline with all features enabled
     tracker = HailoTrackerPipeline(
         rpicamera=use_camera, 
@@ -780,6 +786,7 @@ def main():
         enable_mqtt=args.enable_mqtt,
         enable_recording=args.enable_recording,
         output_video_path=output_path,
+        model_name=args.model,
         enable_debug=args.debug,
     )
     tracker.create_pipeline()

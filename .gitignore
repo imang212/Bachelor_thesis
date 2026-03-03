@@ -2,3 +2,8 @@
 videos
 diagram_convert.py
 architecture.mmd
+src/model_compile/hailo_dataflow_compiler-3.33.0-py3-none-linux_x86_64.whl
+src/model_compile/hailo_model_zoo-2.17.1-py3-none-any.whl
+src/model_compile/coco_full
+src/model_compile/hailo_env
+src/model_compile/.install_logs
