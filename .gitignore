@@ -7,3 +7,5 @@ src/model_compile/hailo_model_zoo-2.17.1-py3-none-any.whl
 src/model_compile/coco_full
 src/model_compile/hailo_env
 src/model_compile/.install_logs
+src/model_compile/calib_dataset_npy
+src/model_compile/calib_dataset

@@ -882,15 +882,15 @@ def run_streamlit():
                 )
                 per = per if per is not None else "10 minutes"
                 selected = INTERVAL_MAP[per]
-                
                 available_classes = sorted(df_detections['class_name'].unique().tolist())
-                selected_classes = st.pills(
-                    "**Filter classes:**",
-                    options=available_classes,
-                    selection_mode="multi",
-                    default=available_classes,
-                    key="class_filter"
-                )
+                #selected_classes = st.pills(
+                #    "**Filter classes:**", 
+                #    options=available_classes,
+                #    selection_mode="multi",
+                #    default=available_classes,
+                #    key="class_filter"
+                #)
+                selected_classes = None
                 st.html("""
                 <style>
                     [data-testid="stButtonGroup"] {
@@ -924,68 +924,63 @@ def run_streamlit():
                 </style>
                 """)
                 active_classes = tuple(sorted(selected_classes if selected_classes else available_classes))
-                df_timeline = df_detections[df_detections['class_name'].isin(active_classes)].copy()
-                df_timeline['timestamp'] = pd.to_datetime(df_timeline['timestamp'], utc=True).dt.tz_localize(None)
-                df_timeline['timestamp'] = df_timeline['timestamp'].dt.tz_convert('UTC').dt.tz_localize(None)
-                df_grouped = (df_timeline.groupby('class_name').resample(selected).size().reset_index(name="count"))
-                df_pivot = df_grouped.pivot_table(index='timestamp', columns='class_name', values='count', fill_value=0).reset_index()
-                df_class_timeline = df_pivot.melt(
-                    id_vars='timestamp',
-                    var_name='class_name',
-                    value_name='count'
-                )
-                # Remove incomplete periods at start and end
-                unique_times = sorted(df_class_timeline['timestamp'].unique())
-                # Fix missing data for classes that don't appear in some time buckets
-                if len(df_class_timeline) > 0 and len(unique_times) > 2:
-                    df_class_timeline = df_class_timeline[(df_class_timeline['timestamp'] > unique_times[0]) & (df_class_timeline['timestamp'] < unique_times[-1])]
-                # Sort classes by total count (descending)
-                class_order = (
-                    df_class_timeline.groupby('class_name')['count']
-                    .sum()
-                    .sort_values(ascending=True)  # Největší první
-                    .index.tolist()
-                )
+                def compute_timeline(df_detections: pd.DataFrame, selected, active_classes):
+                    df_timeline = df_detections[df_detections['class_name'].isin(active_classes)].copy()
+                    df_timeline['timestamp'] = pd.to_datetime(df_timeline['timestamp'], utc=True).dt.tz_localize(None)
+                    df_timeline = df_timeline.set_index("timestamp")
+                    df_grouped = (df_timeline.groupby('class_name').resample(selected)["class_name"].size().reset_index(name="count"))
+                    df_pivot = df_grouped.pivot_table(index='timestamp', columns='class_name', values='count', fill_value=0).reset_index()
+                    df_long = df_pivot.melt(id_vars='timestamp', var_name='class_name', value_name='count')
+                    # Remove incomplete periods at start and end
+                    unique_times = sorted(df_long['timestamp'].unique())
+                    # Fix missing data for classes that don't appear in some time buckets
+                    if len(df_long) > 0 and len(unique_times) > 2:
+                        df_long = df_long[(df_long['timestamp'] > unique_times[0]) & (df_long['timestamp'] < unique_times[-1])]
+                    return df_long
+                df_class_timeline = compute_timeline(df_detections, selected, active_classes)
+                class_order = (df_class_timeline.groupby('class_name')['count'].sum().sort_values(ascending=True).index.tolist())
                 # Convert class_name to categorical with specified order
                 df_class_timeline['class_name'] = pd.Categorical(df_class_timeline['class_name'], categories=class_order, ordered=True)
                 unique_times = sorted(df_class_timeline['timestamp'].unique())
                 columns_count = max(len(unique_times), 1)
-                st.write(f"columns_count: {columns_count}")
-                st.write(f"selected interval: {selected}")
-                st.write(f"active_classes: {active_classes}")
-                st.write(f"unique timestamps: {len(unique_times)}")
-                st.write(f"df shape: {df_class_timeline.shape}")
-                st.write(df_class_timeline.head(10))
-                st.write(f"DTICK_MAP value: {DTICK_MAP[selected]}")
-                st.write(f"FORMAT_MAP value: {FORMAT_MAP[selected]}")
                 if columns_count >= 5:
+                    fig_timeline = go.Figure()
                     # Create stacked bar chart
-                    fig_timeline = px.bar(
-                        df_class_timeline,
-                        x="timestamp",
-                        y="count",
-                        color="class_name",  # Different color per class
-                        title=f"Diagram by detections every {per}",
-                        labels={'count': 'Number of Objects', 'timestamp': 'Time', 'class_name': 'Class'},
-                        barmode='stack',  # Options: 'stack', 'group', 'overlay'
-                        category_orders={'class_name': class_order}
-                    )
+                    if len(active_classes) == 1:
+                        fig_timeline.add_trace(go.Bar(
+                            x=df_class_timeline['timestamp'],
+                            y=df_class_timeline['count'],
+                            name=active_classes[0],
+                        ))
+                    else:
+                        for cls in class_order:
+                            df_cls = df_class_timeline[df_class_timeline['class_name'] == cls]
+                            fig_timeline.add_trace(go.Bar(
+                                x=df_cls['timestamp'],
+                                y=df_cls['count'],
+                                name=cls,
+                            ))
+                        fig_timeline.update_layout(barmode='stack')
+                    fig_timeline.update_traces(marker_line_width=0)
                     fig_timeline.update_xaxes(
                         type="date",
                         title="Time",
+                        ticklabelmode="period",
                         nticks=DTICK_MAP[selected] if columns_count < 60 else 15,
                         tickformat=FORMAT_MAP[selected], 
-                        ticklabelmode="instant",
-                        tickson="boundaries",
-                        ticks="outside",
                         tickangle= -45 if columns_count > 20 else 0
                     )
                     fig_timeline.update_layout(
+                        title=f"Diagram by detections every {per}",
                         height=800,
                         hovermode="x unified", 
-                        yaxis_title="Number of Objects"
+                        yaxis_title="Number of Objects",
+                        legend_title="Class",
+                        xaxis_title="Time",
+                        transition={'duration': 0},
+                        uirevision='constant'
                     )
-                    st.plotly_chart(fig_timeline, use_container_width=True)
+                    st.plotly_chart(fig_timeline, use_container_width=True, config={'displayModeBar': False, 'staticPlot': False,})
                 else:
                     st.info("A little data available for the selected time range.")
                     
