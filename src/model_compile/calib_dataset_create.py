@@ -6,7 +6,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 # --- CONFIGURATION ---
 RTSP_URL = "rtsp://admin:Dcuk.123456@192.168.37.99/Stream"
 OUTPUT_DIR = "calib_dataset"
-TARGET_COUNT = 1050  # Number of photos to capture (100-300 is sufficient for Hailo)
+TARGET_COUNT = 1025  # Number of photos to capture (100-300 is sufficient for Hailo)
 SAVE_EVERY_N_FRAME = 35 
 # Crop settings (same as your pipeline)
 TOP, LEFT = 80, 200

@@ -29,8 +29,8 @@ CREATE TABLE IF NOT EXISTS detections (
     x2 FLOAT NOT NULL,
     y2 FLOAT NOT NULL,
     track_id INT,
-    model TEXT NOT NULL,
-    device TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    device_type TEXT NOT NULL,
     CHECK (x2 > x1 AND y2 > y1)  
 );
 
@@ -40,8 +40,12 @@ CREATE INDEX IF NOT EXISTS idx_det_timestamp_desc ON detections(timestamp_ DESC)
 CREATE INDEX IF NOT EXISTS idx_det_class_timestamp_desc ON detections(class_name, timestamp_ DESC);  -- For class-specific time queries
 CREATE INDEX IF NOT EXISTS idx_det_class ON detections(class_name);
 CREATE INDEX IF NOT EXISTS idx_det_track ON detections(track_id);
+CREATE INDEX IF NOT EXISTS idx_det_model ON detections(model_name);
+CREATE INDEX IF NOT EXISTS idx_det_device ON detections(device_type);
 CREATE INDEX IF NOT EXISTS idx_det_class_time ON detections(class_name, timestamp_);
 CREATE INDEX IF NOT EXISTS idx_det_track_time ON detections(track_id, timestamp_);
+CREATE INDEX IF NOT EXISTS idx_det_model_time ON detections(model_name, timestamp_ DESC);
+CREATE INDEX IF NOT EXISTS idx_det_device_time ON detections(device_type, timestamp_ DESC);
 
 -- Grant privileges
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO hailo_user;
