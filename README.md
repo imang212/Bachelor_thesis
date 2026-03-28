@@ -1,3 +1,10 @@
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![MQTT](https://img.shields.io/badge/MQTT-3B82F6?style=flat&logo=mqtt&logoColor=white)](https://mqtt.org/)
+[![PostgreSQL](https://img.shields.io/badge/postgres-15+-blue.svg)](https://www.postgresql.org/)
+[![Edge Computing](https://img.shields.io/badge/Platform-Raspberry%20Pi-red)](https://www.raspberrypi.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![Status](https://img.shields.io/badge/Status-In%20Development-orange)
+
 # Traffic Monitoring and Analysis System
 **Automated real-time traffic analysis using Computer Vision and Edge Computing.**
 
