@@ -19,45 +19,7 @@ This repository contains the source code for my Bachelor's thesis. The system ha
 ### System Architecture
 The system is divided into an Edge processing unit (AI Module) and a central management layer.
 
-```mermaid
-graph LR
-    subgraph "Raspberry Pi (Edge)"
-        AI["AI Module</br> (Python + GStreamer)"]
-    end
-    
-    subgraph "Network interface"
-        Camera["IP camera"]
-    end
-    
-    subgraph "MQTT Server"
-        MQTT[MQTT Broker]
-    end
-
-    subgraph "Backend"
-        DB[(Database)]
-        DBListener["DB Client (subscriber)"]
-        FastAPI[FastAPI Server]
-    end
-
-    subgraph "Frontend"
-        Streamlit[Streamlit Dashboard]
-    end
-    
-    Camera -->|RTSP stream| AI
-    AI -->|sending| MQTT
-    DBListener --> |listen| MQTT
-    DBListener -->|saving| DB
-    DB -->|reading| DBListener
-    FastAPI -->|reading| DB
-    Streamlit -->|POST/GET| FastAPI
-    
-    style AI fill:#90EE90
-    style Camera fill:#87CEEB
-    style MQTT fill:#FFB6C1
-    style DB fill:#DDA0DD
-    style FastAPI fill:#F0E68C
-    style Streamlit fill:#FFA07A
-```
+<img width="1916" height="882" alt="architecture" src="https://github.com/user-attachments/assets/dfa4d98e-ba95-4ed1-a2a5-d6e2b99d04f2" />
 
 ### Visuals
 **Detection Pipeline:**
